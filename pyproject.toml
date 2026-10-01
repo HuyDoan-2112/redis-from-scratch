@@ -1,0 +1,7 @@
+[project]
+name = "mini-redis"
+version = "0.1.0"
+description = "A Redis-compatible server built from scratch for learning."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
