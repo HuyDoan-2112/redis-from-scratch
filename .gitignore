@@ -12,7 +12,11 @@ __pycache__/
 .coverage
 htmlcov/
 
+# Personal learning notes
+learning-notes/
+
 # Build output
 build/
 dist/
 *.egg-info/
+lessons_learned/

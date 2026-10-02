@@ -11,6 +11,9 @@ class RESPType(StrEnum):
     INTEGER = ":"
     BULK_STRING = "$"
     ARRAY = "*"
+    NULL = "null"  # Not a real prefix: RESP2 null is written as a null bulk string "$-1\r\n"
+
+CRLF = b"\r\n"
 
 # Define a dataclass to represent a value in the RESP protocol.
 @dataclass
@@ -20,6 +23,50 @@ class Value:
     num: int = 0
     bulk: str = ""
     array: List["Value"] = field(default_factory=list) # Default factory gives a new empty list for each instance
+
+    def marshal(self) -> bytes:
+        """Convert this Value into RESP bytes ready to send over the socket."""
+        if self.typ == RESPType.ARRAY:
+            return self._marshal_array()
+        if self.typ == RESPType.BULK_STRING:
+            return self._marshal_bulk()
+        if self.typ == RESPType.SIMPLE_STRING:
+            return self._marshal_string()
+        if self.typ == RESPType.INTEGER:
+            return self._marshal_integer()
+        if self.typ == RESPType.NULL:
+            return self._marshal_null()
+        if self.typ == RESPType.ERROR:
+            return self._marshal_error()
+        return b""
+
+    def _marshal_string(self) -> bytes:
+        # +OK\r\n
+        return b"+" + self.string.encode() + CRLF
+
+    def _marshal_error(self) -> bytes:
+        # -ERR something\r\n
+        return b"-" + self.string.encode() + CRLF
+
+    def _marshal_integer(self) -> bytes:
+        # :42\r\n
+        return b":" + str(self.num).encode() + CRLF
+
+    def _marshal_bulk(self) -> bytes:
+        # $5\r\nhello\r\n
+        # Encode fi rst: the length must count bytes, not characters ("é" is 2 bytes).
+        data = self.bulk.encode()
+        return b"$" + str(len(data)).encode() + CRLF + data + CRLF
+
+    def _marshal_array(self) -> bytes:
+        # *2\r\n<item 1><item 2>
+        out = bytearray(b"*" + str(len(self.array)).encode() + CRLF)
+        for item in self.array:
+            out += item.marshal()  # Each item marshals itself, like v.array[i].Marshal() in Go
+        return bytes(out)
+
+    def _marshal_null(self) -> bytes:
+        return b"$-1\r\n"
 
 
 class RESPReader(object):
@@ -59,19 +106,26 @@ class RESPReader(object):
         line = bytearray() # Create a mutable bytearray to accumulate the read bytes
 
         while True:
-            line.extend(self.reader.read(1)) # Read one byte at a time and add it to the line
+            chunk = self.reader.read(1) # Read one byte at a time and add it to the line
+            if not chunk:
+                raise EOFError("Unexpected end of stream")
+            line.extend(chunk)
             if line.endswith(b"\r\n"): # Check if the line ends with CRLF
                 return bytes(line[:-2]), len(line) # Return the line without CRLF and the number of bytes read
 
-    def _read_integer(self) -> tuple[int, int]:
+    def _read_int_line(self) -> int:
+        """Read a CRLF-terminated integer payload from the stream.""" 
+        line, _ = self._read_line()
+        return int(line)
+
+    def _read_integer(self) -> Value:
         """
-        Read an integer from the stream, terminated by CRLF (\r\n).
+        Read a RESP integer from the stream, terminated by CRLF (\r\n).
 
         Returns:
-            tuple[int, int]: A tuple containing the integer read and the number of bytes read.
+            Value: The parsed RESP integer value.
         """
-        line, bytes_read = self._read_line() # Read a line from the stream
-        return int(line), bytes_read # Convert the line to an integer and return it along with the number of bytes read
+        return Value(typ=RESPType.INTEGER, num=self._read_int_line()) # Return a Value object representing the RESP integer
 
     def _read(self) -> Value:
         """
@@ -101,7 +155,7 @@ class RESPReader(object):
         Returns:
             Value: The parsed RESP array.
         """
-        length, bytes_read = self._read_integer() # Read the length of the array
+        length = self._read_int_line() # Read the length of the array
         if length < 0:
             raise ValueError("Null array length is not supported") # Raise an error for negative lengths
 
@@ -120,7 +174,7 @@ class RESPReader(object):
         Returns:
             Value: The parsed RESP bulk string.
         """
-        length, bytes_read = self._read_integer() # Read the length of the bulk string
+        length = self._read_int_line() # Read the length of the bulk string
 
         if length == -1: # A length of -1 indicates a null bulk string
             raise ValueError("Null bulk strings are not supported")
@@ -134,3 +188,10 @@ class RESPReader(object):
 
 
 class RESPWriter(object):
+    def __init__(self, writer: BinaryIO):
+        self.writer = writer
+
+    def write(self, value: Value) -> None:
+        """Marshal a Value and write the bytes to the underlying stream."""
+        self.writer.write(value.marshal())
+        self.writer.flush()  # Send immediately instead of leaving bytes in a buffer
