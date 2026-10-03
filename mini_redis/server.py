@@ -1,30 +1,59 @@
-"""Server lifecycle and event loop.
-
-TODO: Create, bind, and listen on a non-blocking TCP socket.
-Use a selector to accept clients, receive bytes, and send pending replies.
-Own the client registry and clean up resources on failure or shutdown.
+"""
+Server lifecycle and event loop.
 """
 
 import socket # Import the socket module for network communication
-import threading # Import the threading module to handle multiple clients concurrently
+import threading
 
 from mini_redis.config import DEFAULT_CONFIG, ServerConfig
-
+from mini_redis.resp import RESPReader, RESPWriter, Value, RESPType
+from mini_redis.handler import handlers
 
 # handle one client connection: keep reading requests until the client disconnects
 def handle_client(client_socket, config: ServerConfig):
     # loop so a single thread can serve multiple pings on the same connection
+    client_file = client_socket.makefile("rwb") # create a file-like object for reading and writing bytes
+    reader = RESPReader(client_file) # create a RESPReader to parse incoming commands
+    writer = RESPWriter(client_file) # create a RESPWriter to send responses back to the client
+
     while True:
-        # receive data from the client; recv blocks until bytes arrive
-        request = client_socket.recv(config.recv_buffer_size) # recv method receives data from the client socket, with a maximum buffer size of recv_buffer_size bytes
-        # an empty read means the client closed the connection, so stop looping
-        if not request:
+        try:
+            request = reader.read()
+        except EOFError or ConnectionResetError or BrokenPipeError:
+            # The client disconnected, so stop handling this connection.
             break
-        print(f"[+] Received: {request}")
-        # redis-cli expects a RESP simple string reply for PING: +PONG\r\n
-        client_socket.send(b"+PONG\r\n")
-    # close the socket once the client has disconnected
-    client_socket.close()
+        except Exception:
+            # The bytes were not valid RESP, so return a Redis error and close this connection.
+            writer.write(Value(typ=RESPType.ERROR, string="ERR malformed RESP"))
+            break
+
+        if request.typ != RESPType.ARRAY or not request.array:
+            writer.write(Value(typ=RESPType.ERROR, string="ERR empty command"))
+            continue
+
+        command_value = request.array[0]
+        command = command_value.bulk.upper()
+        args = request.array[1:]
+
+        if not command:
+            writer.write(Value(typ=RESPType.ERROR, string="ERR empty command"))
+            continue
+
+        handler = handlers.get(command)
+        if handler is None:
+            writer.write(Value(typ=RESPType.ERROR, string=f"ERR unknown command '{command}'"))
+            continue
+
+        try:
+            response = handler(args) # call the handler with the command arguments
+        except Exception as e:
+            writer.write(Value(typ=RESPType.ERROR, string=f"ERR {str(e)}"))
+            continue
+
+        writer.write(response) # send the marshaled response back to the client
+
+    client_file.close() # close the file-like object to release resources
+    client_socket.close()  # close the socket once the client has disconnected
 
 
 def run(config: ServerConfig = DEFAULT_CONFIG) -> None:

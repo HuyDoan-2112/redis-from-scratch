@@ -1,9 +1,9 @@
 from typing import Any, List, Optional, BinaryIO
 from dataclasses import dataclass, field
-from enum import StrEnum
+from enum import Enum
 
 # Define constants that represent each type of RESP data.
-class RESPType(StrEnum):
+class RESPType(str, Enum):
     """RESP data types."""
 
     SIMPLE_STRING = "+"
@@ -127,7 +127,7 @@ class RESPReader(object):
         """
         return Value(typ=RESPType.INTEGER, num=self._read_int_line()) # Return a Value object representing the RESP integer
 
-    def _read(self) -> Value:
+    def read(self) -> Value:
         """
         Read a RESP value from the stream.
 
@@ -162,10 +162,15 @@ class RESPReader(object):
         array = [] # Initialize an empty list to hold the array elements
 
         for _ in range(length): # Read each element of the array
-            value = self._read() # Read a RESP value
+            value = self.read() # Read a RESP value
             array.append(value) # Add the value to the array
 
         return Value(typ=RESPType.ARRAY, array=array) # Return a Value object representing the RESP array
+
+    def _read_simple_string(self) -> Value:
+        """Read a RESP simple string from the stream."""
+        line, _ = self._read_line()
+        return Value(typ=RESPType.SIMPLE_STRING, string=line.decode())
 
     def _read_bulk_string(self) -> Value:
         """
