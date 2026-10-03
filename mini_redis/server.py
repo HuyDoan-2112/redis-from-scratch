@@ -7,10 +7,11 @@ import threading
 
 from mini_redis.config import DEFAULT_CONFIG, ServerConfig
 from mini_redis.resp import RESPReader, RESPWriter, Value, RESPType
-from mini_redis.handler import handlers
+from mini_redis.handler import handlers, store, store_lock
+from mini_redis.aof import AOF
 
 # handle one client connection: keep reading requests until the client disconnects
-def handle_client(client_socket, config: ServerConfig):
+def handle_client(client_socket, config: ServerConfig, aof: AOF | None, write_lock: threading.Lock):
     # loop so a single thread can serve multiple pings on the same connection
     client_file = client_socket.makefile("rwb") # create a file-like object for reading and writing bytes
     reader = RESPReader(client_file) # create a RESPReader to parse incoming commands
@@ -38,14 +39,36 @@ def handle_client(client_socket, config: ServerConfig):
         if not command:
             writer.write(Value(typ=RESPType.ERROR, string="ERR empty command"))
             continue
-
+        
         handler = handlers.get(command)
         if handler is None:
             writer.write(Value(typ=RESPType.ERROR, string=f"ERR unknown command '{command}'"))
             continue
 
         try:
-            response = handler(args) # call the handler with the command arguments
+            if command in {"SET", "HSET"}:
+                with write_lock:
+                    expected_args = 2 if command == "SET" else 3
+                    if len(args) != expected_args or any(
+                        arg.typ != RESPType.BULK_STRING for arg in args
+                    ):
+                        response = Value(typ=RESPType.ERROR, string=f"ERR wrong arguments for '{command}' command")
+                    else:
+                        response = None
+                        if command == "HSET":
+                            with store_lock:
+                                existing = store.get(args[0].bulk)
+                                if existing is not None and existing[0] != 'hash':
+                                    response = Value(
+                                        typ=RESPType.ERROR,
+                                        string= "WRONGTYPE Ookperation against a key holding the wrong kind of value"
+                                    )
+                        if response is None:
+                            if aof is not None:
+                                aof.write(request)
+                            response = handler(args)
+            else:
+                response = handler(args) # call the handler with the command arguments
         except Exception as e:
             writer.write(Value(typ=RESPType.ERROR, string=f"ERR {str(e)}"))
             continue
@@ -55,8 +78,27 @@ def handle_client(client_socket, config: ServerConfig):
     client_file.close() # close the file-like object to release resources
     client_socket.close()  # close the socket once the client has disconnected
 
+def replay_command(request: Value) -> None:
+    if request.typ != RESPType.ARRAY or not request.array:
+        raise ValueError("Invalid command in AOF")
+
+    command = request.array[0].bulk.upper()
+    if command not in {"SET", "HSET"}:
+        raise ValueError(f"Unexpected command in AOF: {command}")
+
+    response = handlers[command](request.array[1:])
+    if response.typ == RESPType.ERROR:
+        raise ValueError(f"Failed to replay {command}: {response.string}")
 
 def run(config: ServerConfig = DEFAULT_CONFIG) -> None:
+    aof = AOF(config.aof) if config.aof.enabled else None
+    if aof is not None:
+        try:
+            aof.read(replay_command)
+        except Exception:
+            aof.close()
+            raise
+    write_lock = threading.Lock()      
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM) # AF_INET = IPv4, SOCK_STREAM = TCP
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # allow immediate rebinding of the port after restart
     server.bind((config.host, config.port)) # bind the socket to the given host and port
@@ -73,7 +115,7 @@ def run(config: ServerConfig = DEFAULT_CONFIG) -> None:
         client, addr = server.accept()
         print(f"[+] Accepted connection from {addr[0]}:{addr[1]}")
         # spin up our client thread to handle the new connection
-        client_handler = threading.Thread(target=handle_client, args=(client, config))
+        client_handler = threading.Thread(target=handle_client, args=(client, config, aof, write_lock))
         client_handler.start() 
 
 

@@ -28,7 +28,7 @@ def set(args: List[Value]) -> Value:
     value = args[1].bulk
 
     with store_lock:
-        store[key] = (value, None)  # None indicates no expiration
+        store[key] = ("string", value) 
 
     return Value(typ=RESPType.SIMPLE_STRING, string="OK")
 

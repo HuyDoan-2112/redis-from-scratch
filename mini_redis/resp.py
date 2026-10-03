@@ -144,7 +144,9 @@ class RESPReader(object):
             return self._read_integer() # If it's an integer, call the _read_integer method
         if resp_type == b"+":
             return self._read_simple_string() # If it's a simple string, call the _read_simple_string method
-
+        if resp_type == b"":
+            raise EOFError("End of stream")
+        
         raise ValueError(f"Unsupported RESP type: {resp_type}") # Raise an error for unsupported types
 
 
