@@ -120,7 +120,7 @@ class Command:
 
 COMMANDS: dict[str, Command] = {c.name: c for c in [
     Command("PING", ping, -1),
-    Command("SET", set, 3, write=True),
+    Command("SET", set_cmd, 3, write=True),
     Command("GET", get, 2),
     Command("HSET", hset, 4, write=True),
     Command("HGET", hget, 3),
