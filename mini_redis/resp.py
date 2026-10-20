@@ -21,7 +21,7 @@ class Value:
     typ: str = ""
     string: str = ""
     num: int = 0
-    bulk: str = ""
+    bulk: bytes = b""
     array: List["Value"] = field(default_factory=list) # Default factory gives a new empty list for each instance
 
     def marshal(self) -> bytes:
@@ -55,14 +55,14 @@ class Value:
     def _marshal_bulk(self) -> bytes:
         # $5\r\nhello\r\n
         # Encode fi rst: the length must count bytes, not characters ("é" is 2 bytes).
-        data = self.bulk.encode()
+        data = self.bulk
         return b"$" + str(len(data)).encode() + CRLF + data + CRLF
 
     def _marshal_array(self) -> bytes:
         # *2\r\n<item 1><item 2>
         out = bytearray(b"*" + str(len(self.array)).encode() + CRLF)
         for item in self.array:
-            out += item.marshal()  # Each item marshals itself, like v.array[i].Marshal() in Go
+            out += item.marshal()  # Each item marshals itself
         return bytes(out)
 
     def _marshal_null(self) -> bytes:
@@ -103,16 +103,13 @@ class RESPReader(object):
         Returns:
             tuple[bytes, int]: A tuple containing the line read (without CRLF) and the number of bytes read.
         """
-        line = bytearray() # Create a mutable bytearray to accumulate the read bytes
+        line = self.reader.readline(64*1024) # Read a line with a maximum length of 64KB
+        if not line.endswith(b"\n"):
+            raise EOFError("Unexpected end of stream")
+        if not line.endswith(b"\r\n"):
+            raise ValueError("Line does not end with CRLF")
 
-        while True:
-            chunk = self.reader.read(1) # Read one byte at a time and add it to the line
-            if not chunk:
-                raise EOFError("Unexpected end of stream")
-            line.extend(chunk)
-            if line.endswith(b"\r\n"): # Check if the line ends with CRLF
-                return bytes(line[:-2]), len(line) # Return the line without CRLF and the number of bytes read
-
+        return line[:-2], len(line) # Return the line without CRLF and the total number of bytes read
     def _read_int_line(self) -> int:
         """Read a CRLF-terminated integer payload from the stream.""" 
         line, _ = self._read_line()
@@ -191,7 +188,7 @@ class RESPReader(object):
         if self._read_exact(2) != b"\r\n": # Ensure the bulk string is terminated by CRLF
             raise ValueError("Bulk string not terminated with CRLF")
 
-        return Value(typ=RESPType.BULK_STRING, bulk=bulk.decode()) # Return a Value object representing the RESP bulk string
+        return Value(typ=RESPType.BULK_STRING, bulk=bulk) # Return a Value object representing the RESP bulk string
 
 
 class RESPWriter(object):

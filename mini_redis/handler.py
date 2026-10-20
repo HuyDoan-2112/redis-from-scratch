@@ -1,12 +1,13 @@
 # Import List for type hints like List[Value], and Callable for function type hints.
 import threading
 from typing import List, Callable
+from dataclasses import dataclass, field
 
 # Import the RESP Value class used for command arguments and responses.
 from mini_redis.resp import Value, RESPType
 
 store_lock = threading.Lock()  # A lock to ensure thread-safe access to the store.
-store: dict[str, tuple[str, object]] = {} # A global dictionary to store key-value pairs, where the value is a tuple of (value, expiration_time).
+store: dict[bytes, tuple[str, object]] = {} # A global dictionary to store key-value pairs, where the value is a tuple of (value, expiration_time).
 # Define a handler function for the PING command.
 # It receives a list of RESP Values and returns one RESP Value.
 def ping(args: List[Value]) -> Value:
@@ -18,9 +19,9 @@ def ping(args: List[Value]) -> Value:
     if len(args) == 0:
         return Value(typ=RESPType.SIMPLE_STRING, string="PONG")
     
-    return Value(typ=RESPType.SIMPLE_STRING, string=args[0].bulk)  # Echo back the first argument if provided.
+    return Value(typ=RESPType.SIMPLE_STRING, bulk=args[0].bulk)  # Echo back the first argument if provided.
  
-def set(args: List[Value]) -> Value:
+def set_cmd(args: List[Value]) -> Value:
     if len(args) != 2:
         return Value(typ=RESPType.ERROR, string="ERR wrong number of arguments for 'set' command")
     
@@ -46,7 +47,7 @@ def get(args: List[Value]) -> Value:
     
     typ, value = item
     if typ != "string":
-        return Value(typ=RESPType.ERROR, string=f"ERR wrong type for key '{key}'")  # Return an error if the key is not a string.
+        return Value(typ=RESPType.ERROR, string=f"ERR wrong type for key")  # Return an error if the key is not a string.
     
     return Value(typ=RESPType.BULK_STRING, bulk=value)  # Return the value as a RESP bulk string if the key exists.
 
@@ -95,14 +96,32 @@ def hget(args: List[Value]) -> Value:
     
     return Value(typ=RESPType.BULK_STRING, bulk=value)  # Return the value as a RESP bulk string if the key exists in the hash.
 
-# Create a dictionary that maps command names to handler functions.
-# The key is a string command name, and the value is a callable handler.
-# Callable [arguments, return type]
-handlers: dict[str, Callable[[List[Value]], Value]] = {
-    # When the command is "PING", call the ping function.
-    "PING": ping,
-    "SET": set,
-    "GET": get,
-    "HSET": hset,
-    "HGET": hget,
-}
+# # Create a dictionary that maps command names to handler functions.
+# # The key is a string command name, and the value is a callable handler.
+# # Callable [arguments, return type]
+# handlers: dict[str, Callable[[List[Value]], Value]] = {
+#     # When the command is "PING", call the ping function.
+#     "PING": ping,
+#     "SET": set,
+#     "GET": get,
+#     "HSET": hset,
+#     "HGET": hget,
+# }
+
+@dataclass(frozen=True)
+class Command:
+    name: str
+    handler: Callable[[List[Value]], Value]
+    arity: int   # counts the command name; negative means "at least"
+    write: bool = False  # True if the command modifies the store, False if it only reads
+
+    def arity_ok(self, n: int) -> bool:
+        return n == self.arity if self.arity > 0 else n >= -self.arity
+
+COMMANDS: dict[str, Command] = {c.name: c for c in [
+    Command("PING", ping, -1),
+    Command("SET", set, 3, write=True),
+    Command("GET", get, 2),
+    Command("HSET", hset, 4, write=True),
+    Command("HGET", hget, 3),
+]}

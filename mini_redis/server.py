@@ -7,7 +7,7 @@ import threading
 
 from mini_redis.config import DEFAULT_CONFIG, ServerConfig
 from mini_redis.resp import RESPReader, RESPWriter, Value, RESPType
-from mini_redis.handler import handlers, store, store_lock
+from mini_redis.handler import handlers, store, store_lock, COMMANDS
 from mini_redis.aof import AOF
 
 # handle one client connection: keep reading requests until the client disconnects
@@ -20,7 +20,7 @@ def handle_client(client_socket, config: ServerConfig, aof: AOF | None, write_lo
     while True:
         try:
             request = reader.read()
-        except EOFError or ConnectionResetError or BrokenPipeError:
+        except (EOFError, ConnectionResetError, BrokenPipeError):
             # The client disconnected, so stop handling this connection.
             break
         except Exception:
@@ -33,42 +33,30 @@ def handle_client(client_socket, config: ServerConfig, aof: AOF | None, write_lo
             continue
 
         command_value = request.array[0]
-        command = command_value.bulk.upper()
+        command = command_value.bulk.decode(errors="replace").upper()
         args = request.array[1:]
 
         if not command:
             writer.write(Value(typ=RESPType.ERROR, string="ERR empty command"))
             continue
         
-        handler = handlers.get(command)
-        if handler is None:
+        cmd = COMMANDS.get(command)
+        if cmd is None:
             writer.write(Value(typ=RESPType.ERROR, string=f"ERR unknown command '{command}'"))
+            continue
+        if not cmd.arity_ok(len(request.array)):
+            writer.write(Value(typ=RESPType.ERROR, string=f"ERR wrong number of arguments for '{command}' command"))
             continue
 
         try:
-            if command in {"SET", "HSET"}:
+            if cmd.write:
+                # Same lock for running and logging, so the AOF order matches the real order.
                 with write_lock:
-                    expected_args = 2 if command == "SET" else 3
-                    if len(args) != expected_args or any(
-                        arg.typ != RESPType.BULK_STRING for arg in args
-                    ):
-                        response = Value(typ=RESPType.ERROR, string=f"ERR wrong arguments for '{command}' command")
-                    else:
-                        response = None
-                        if command == "HSET":
-                            with store_lock:
-                                existing = store.get(args[0].bulk)
-                                if existing is not None and existing[0] != 'hash':
-                                    response = Value(
-                                        typ=RESPType.ERROR,
-                                        string= "WRONGTYPE Ookperation against a key holding the wrong kind of value"
-                                    )
-                        if response is None:
-                            if aof is not None:
-                                aof.write(request)
-                            response = handler(args)
+                    response = cmd.handler(args)
+                    if aof is not None and response.typ != RESPType.ERROR:
+                        aof.write(request)
             else:
-                response = handler(args) # call the handler with the command arguments
+                response = cmd.handler(args)
         except Exception as e:
             writer.write(Value(typ=RESPType.ERROR, string=f"ERR {str(e)}"))
             continue
@@ -82,11 +70,12 @@ def replay_command(request: Value) -> None:
     if request.typ != RESPType.ARRAY or not request.array:
         raise ValueError("Invalid command in AOF")
 
-    command = request.array[0].bulk.upper()
-    if command not in {"SET", "HSET"}:
+    command = request.array[0].bulk.decode(errors="replace").upper()
+    cmd =  COMMANDS.get(command)
+    if cmd is None and not cmd.write:
         raise ValueError(f"Unexpected command in AOF: {command}")
 
-    response = handlers[command](request.array[1:])
+    response = cmd.handler(request.array[1:])
     if response.typ == RESPType.ERROR:
         raise ValueError(f"Failed to replay {command}: {response.string}")
 
