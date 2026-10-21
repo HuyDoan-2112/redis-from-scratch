@@ -91,11 +91,19 @@ mini_redis/
   __main__.py     command-line options, starts the server
   config.py       server and AOF settings
   server.py       TCP listener, one thread per client, command dispatch
-  connection.py   per-client state (planned for the event loop)
+  client.py       per-client state (planned for the event loop)
   resp.py         RESP parser and encoder
-  handler.py      command handlers, the in-memory store, and the command table
-  aof.py          append-only file: write, fsync thread, replay, crash recovery
+  commands/
+    registry.py   command table: name, handler, arity, write flag
+    connection.py PING
+    strings.py    SET, GET
+    hashes.py     HSET, HGET
+  storage/
+    keyspace.py   the in-memory store and its lock
+  persistence/
+    aof.py        append-only file: write, fsync thread, replay, crash recovery
 tests/
+  helpers.py      build RESP commands and replay an AOF in tests
   test_aof.py     AOF crash recovery tests
   test_server.py  server tests (planned)
 docs/

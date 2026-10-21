@@ -7,8 +7,8 @@ import threading
 
 from mini_redis.config import DEFAULT_CONFIG, ServerConfig
 from mini_redis.resp import RESPReader, RESPWriter, Value, RESPType
-from mini_redis.handler import COMMANDS
-from mini_redis.aof import AOF
+from mini_redis.commands.registry import COMMANDS
+from mini_redis.persistence.aof import AOF
 
 # handle one client connection: keep reading requests until the client disconnects
 def handle_client(client_socket, config: ServerConfig, aof: AOF | None, write_lock: threading.Lock):

@@ -19,9 +19,11 @@ Implemented:
 | File | What works |
 | --- | --- |
 | `resp.py` | RESP2 parser and encoder for arrays, bulk strings, simple strings, integers, and errors. |
-| `handler.py` | `PING`, `SET`, `GET`, `HSET`, `HGET`, stored in one global dict. |
-| `aof.py` | Append-only file. Writes each `SET`/`HSET`, flushes and fsyncs once per second, replays on startup. |
+| `commands/` | `PING`, `SET`, `GET`, `HSET`, `HGET`, and the command table with arity checks and a `write` flag. |
+| `storage/keyspace.py` | One global dict and a lock that hold every key. |
+| `persistence/aof.py` | Append-only file. Writes each `SET`/`HSET`, flushes and fsyncs once per second, replays on startup. |
 | `server.py` | TCP server with one thread per client and a global lock. |
+| `__main__.py` | Command-line options: `--host`, `--port`, `--aof`, `--aof-path`. |
 | `tests/test_aof.py` | 6 tests for AOF crash recovery. |
 
 ## 2. Target design
@@ -79,7 +81,7 @@ Rules:
 TCP is a byte stream. One `recv()` can return half a command, one command, or
 ten commands. One `send()` can accept only part of a reply.
 
-`connection.py` holds the state for one client:
+`client.py` holds the state for one client:
 
 | Field | Purpose |
 | --- | --- |
@@ -157,10 +159,11 @@ mini_redis/
   __main__.py          argparse: --port, --aof, --appendfsync, --dir
   config.py
   server.py            event loop, timers, shutdown
-  connection.py        per-client buffers
+  client.py            per-client buffers
   resp.py              parser and encoder
   commands/
     registry.py        Command table
+    connection.py      PING ECHO
     strings.py         SET GET INCR ...
     keys.py            DEL EXISTS EXPIRE TTL TYPE
     hashes.py
@@ -204,7 +207,7 @@ Move to the target design before adding features.
 | Step | Work | Done when |
 | --- | --- | --- |
 | 1.1 | Keys and values as `bytes` | `SET k "\xff\xfe"` then `GET k` returns the same bytes. |
-| 1.2 | `selectors` event loop and `connection.py` buffers | A command split across two `send()` calls works. 100 clients connected at once, one idle client does not block the others. |
+| 1.2 | `selectors` event loop and `client.py` buffers | A command split across two `send()` calls works. 100 clients connected at once, one idle client does not block the others. |
 | 1.3 | Command table with arity and flags | `server.py` contains no command names. |
 | 1.4 | `__main__.py` with argparse | `python -m mini_redis --aof` starts with AOF on. |
 | 1.5 | Clean shutdown on SIGINT and SIGTERM | AOF is flushed and fsynced, all sockets closed, exit code 0. |
