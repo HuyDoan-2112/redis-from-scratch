@@ -93,10 +93,11 @@ mini_redis/
   server.py       TCP listener, one thread per client, command dispatch
   connection.py   per-client state (planned for the event loop)
   resp.py         RESP parser and encoder
-  handler.py      command handlers and the command table
+  handler.py      command handlers, the in-memory store, and the command table
   aof.py          append-only file: write, fsync thread, replay, crash recovery
 tests/
   test_aof.py     AOF crash recovery tests
+  test_server.py  server tests (planned)
 docs/
   architecture.md design and roadmap
 ```

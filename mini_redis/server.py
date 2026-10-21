@@ -7,7 +7,7 @@ import threading
 
 from mini_redis.config import DEFAULT_CONFIG, ServerConfig
 from mini_redis.resp import RESPReader, RESPWriter, Value, RESPType
-from mini_redis.handler import handlers, store, store_lock, COMMANDS
+from mini_redis.handler import COMMANDS
 from mini_redis.aof import AOF
 
 # handle one client connection: keep reading requests until the client disconnects
@@ -72,7 +72,7 @@ def replay_command(request: Value) -> None:
 
     command = request.array[0].bulk.decode(errors="replace").upper()
     cmd =  COMMANDS.get(command)
-    if cmd is None and not cmd.write:
+    if cmd is None or not cmd.write:
         raise ValueError(f"Unexpected command in AOF: {command}")
 
     response = cmd.handler(request.array[1:])
