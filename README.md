@@ -17,6 +17,11 @@ Working now:
   errors, null)
 - Binary-safe keys and values: any bytes, not only UTF-8 text
 - Pipelining: several commands in one packet get their replies in order
+- Single-threaded event loop (`selectors`, epoll on Linux): one thread serves
+  every client, so commands need no locks
+- Partial input and output: a command split across several packets waits in
+  the client's input buffer, and a reply the socket cannot take at once waits
+  in its output buffer, so a slow client never blocks the others
 - Command table with arity checks and a `write` flag
 - Append-only file (AOF): every write command is logged and replayed on
   startup, with an fsync once per second
@@ -25,7 +30,6 @@ Working now:
 
 Not yet:
 
-- Single-threaded event loop (the server uses one thread per client for now)
 - Inline commands (`PING` typed in telnet)
 - Expiry, `DEL`, `EXISTS`, `INCR`, and the other commands in the roadmap
 
@@ -90,8 +94,8 @@ crash, and checks that the server restarts with the right data.
 mini_redis/
   __main__.py     command-line options, starts the server
   config.py       server and AOF settings
-  server.py       TCP listener, one thread per client, command dispatch
-  client.py       per-client state (planned for the event loop)
+  server.py       event loop: accept, read, run commands, write replies
+  client.py       per-client state: socket, input and output buffers
   resp.py         RESP parser and encoder
   commands/
     registry.py   command table: name, handler, arity, write flag
@@ -99,7 +103,7 @@ mini_redis/
     strings.py    SET, GET
     hashes.py     HSET, HGET
   storage/
-    keyspace.py   the in-memory store and its lock
+    keyspace.py   the in-memory store
   persistence/
     aof.py        append-only file: write, fsync thread, replay, crash recovery
 tests/

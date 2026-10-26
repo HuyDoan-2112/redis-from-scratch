@@ -1,6 +1,14 @@
-"""State for one connected client.
+import socket
 
-TODO: Track its socket, input buffer, output buffer, and connection state.
-Preserve incomplete requests and unsent reply bytes between events.
-Keep every client's buffers separate.
-"""
+from dataclasses import dataclass, field
+
+@dataclass
+class Client:
+    """per-connection state"""
+
+    sock:  socket.socket
+    # buffered input and output
+    inbuf: bytearray = field(default_factory=bytearray)
+    outbuf: bytearray = field(default_factory=bytearray)
+
+    closing: bool = False

@@ -134,13 +134,13 @@ class RESPReader(object):
         resp_type = self.reader.read(1) # Read the first byte to determine the RESP type
 
         if resp_type == b"*":
-            return self._read_array() # If it's an array, call the _read_array method
+            return self._read_array() 
         if resp_type == b"$":
-            return self._read_bulk_string() # If it's a bulk string, call the _read_bulk_string method
+            return self._read_bulk_string() 
         if resp_type == b":":
-            return self._read_integer() # If it's an integer, call the _read_integer method
+            return self._read_integer() 
         if resp_type == b"+":
-            return self._read_simple_string() # If it's a simple string, call the _read_simple_string method
+            return self._read_simple_string() 
         if resp_type == b"":
             raise EOFError("End of stream")
         
@@ -189,13 +189,3 @@ class RESPReader(object):
             raise ValueError("Bulk string not terminated with CRLF")
 
         return Value(typ=RESPType.BULK_STRING, bulk=bulk) # Return a Value object representing the RESP bulk string
-
-
-class RESPWriter(object):
-    def __init__(self, writer: BinaryIO):
-        self.writer = writer
-
-    def write(self, value: Value) -> None:
-        """Marshal a Value and write the bytes to the underlying stream."""
-        self.writer.write(value.marshal())
-        self.writer.flush()  # Send immediately instead of leaving bytes in a buffer

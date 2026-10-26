@@ -2,69 +2,16 @@
 Server lifecycle and event loop.
 """
 
+import io
 import socket # Import the socket module for network communication
-import threading
+import selectors
 
 from mini_redis.config import DEFAULT_CONFIG, ServerConfig
-from mini_redis.resp import RESPReader, RESPWriter, Value, RESPType
+from mini_redis.resp import RESPReader, Value, RESPType
 from mini_redis.commands.registry import COMMANDS
 from mini_redis.persistence.aof import AOF
+from mini_redis.client import Client
 
-# handle one client connection: keep reading requests until the client disconnects
-def handle_client(client_socket, config: ServerConfig, aof: AOF | None, write_lock: threading.Lock):
-    # loop so a single thread can serve multiple pings on the same connection
-    client_file = client_socket.makefile("rwb") # create a file-like object for reading and writing bytes
-    reader = RESPReader(client_file) # create a RESPReader to parse incoming commands
-    writer = RESPWriter(client_file) # create a RESPWriter to send responses back to the client
-
-    while True:
-        try:
-            request = reader.read()
-        except (EOFError, ConnectionResetError, BrokenPipeError):
-            # The client disconnected, so stop handling this connection.
-            break
-        except Exception:
-            # The bytes were not valid RESP, so return a Redis error and close this connection.
-            writer.write(Value(typ=RESPType.ERROR, string="ERR malformed RESP"))
-            break
-
-        if request.typ != RESPType.ARRAY or not request.array:
-            writer.write(Value(typ=RESPType.ERROR, string="ERR empty command"))
-            continue
-
-        command_value = request.array[0]
-        command = command_value.bulk.decode(errors="replace").upper()
-        args = request.array[1:]
-
-        if not command:
-            writer.write(Value(typ=RESPType.ERROR, string="ERR empty command"))
-            continue
-        
-        cmd = COMMANDS.get(command)
-        if cmd is None:
-            writer.write(Value(typ=RESPType.ERROR, string=f"ERR unknown command '{command}'"))
-            continue
-        if not cmd.arity_ok(len(request.array)):
-            writer.write(Value(typ=RESPType.ERROR, string=f"ERR wrong number of arguments for '{command}' command"))
-            continue
-
-        try:
-            if cmd.write:
-                # Same lock for running and logging, so the AOF order matches the real order.
-                with write_lock:
-                    response = cmd.handler(args)
-                    if aof is not None and response.typ != RESPType.ERROR:
-                        aof.write(request)
-            else:
-                response = cmd.handler(args)
-        except Exception as e:
-            writer.write(Value(typ=RESPType.ERROR, string=f"ERR {str(e)}"))
-            continue
-
-        writer.write(response) # send the marshaled response back to the client
-
-    client_file.close() # close the file-like object to release resources
-    client_socket.close()  # close the socket once the client has disconnected
 
 def replay_command(request: Value) -> None:
     if request.typ != RESPType.ARRAY or not request.array:
@@ -87,26 +34,152 @@ def run(config: ServerConfig = DEFAULT_CONFIG) -> None:
         except Exception:
             aof.close()
             raise
-    write_lock = threading.Lock()      
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM) # AF_INET = IPv4, SOCK_STREAM = TCP
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # allow immediate rebinding of the port after restart
-    server.bind((config.host, config.port)) # bind the socket to the given host and port
-    # we tell the server to start listening with
+    sel = selectors.DefaultSelector()
+    lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM) # AF_INET = IPv4, SOCK_STREAM = TCP
+    lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # allow immediate rebinding of the port after restart
+    lsock.bind((config.host, config.port)) # bind the socket to the given host and port
+   
     # a maximum backlog of connections set in config
-    server.listen(config.listen_backlog)
+    lsock.listen(config.listen_backlog)
 
     print(f"Server listening on {config.host}:{config.port}")
 
-    while True: # accept loop: handle each new client in its own thread
-        # When a client connects we receive the
-        # client socket into the client variable, and
-        # the remote connection details into the addr variable
-        client, addr = server.accept()
-        print(f"[+] Accepted connection from {addr[0]}:{addr[1]}")
-        # spin up our client thread to handle the new connection
-        client_handler = threading.Thread(target=handle_client, args=(client, config, aof, write_lock))
-        client_handler.start() 
+    lsock.setblocking(False)
+    sel.register(lsock, selectors.EVENT_READ, data=None)
 
+    try:
+        while True:
+            events = sel.select(timeout=None)
+            for key, mask in events:
+                if key.data is None:
+                    accept_wrapper(key.fileobj, sel)
+                else:
+                    service_connection(key, mask, sel, aof, config)
+    except KeyboardInterrupt:
+        print("Caught keyboard interrupt, exiting")
+    finally:
+        sel.close()
+
+def accept_wrapper(sock: socket.socket, sel: selectors.BaseSelector) -> None:
+    try:
+        conn, addr = sock.accept()
+    except BlockingIOError:
+        return 
+    except ConnectionAbortedError:
+        return
+
+    print(f"[+] Accepted connection from {addr[0]}:{addr[1]}")
+    conn.setblocking(False)
+    client = Client(sock=conn)
+    events = selectors.EVENT_READ 
+    sel.register(conn, events, data=client)
+
+def service_connection(
+        key: selectors.SelectorKey, 
+        mask: int, 
+        sel: selectors.BaseSelector, 
+        aof: AOF | None,
+        config: ServerConfig
+) -> None:
+    
+    client: Client = key.data
+    sock = client.sock
+    if mask & selectors.EVENT_READ:
+        try:
+            recv_data = sock.recv(config.recv_buffer_size)
+        except BlockingIOError:
+            return
+        except ConnectionResetError:
+            close_client(sel, client)
+            return
+        
+        if not recv_data:
+            close_client(sel, client)
+            return
+        client.inbuf += recv_data
+        process_input(client, aof)
+        flush_output(sel, client)
+
+    if mask & selectors.EVENT_WRITE:
+        flush_output(sel, client)
+
+def process_input(client: Client, aof: AOF | None) -> None:
+    if client.closing:
+        return
+    
+    while True:
+        try:
+            bio = io.BytesIO(client.inbuf)
+            request = RESPReader(bio).read()
+        except EOFError:
+            break
+        except ValueError:
+            client.outbuf += b"-ERR Protocol error\r\n"
+            client.closing = True
+            break
+
+        del client.inbuf[:bio.tell()]
+        client.outbuf += execute(request, aof).marshal()
+
+
+def close_client(sel: selectors.BaseSelector, client: Client) -> None:
+    sel.unregister(client.sock)
+    client.sock.close()
+
+def execute(request: Value, aof: AOF | None) -> Value:
+
+    if request.typ != RESPType.ARRAY or not request.array:
+        return Value(typ=RESPType.ERROR, string="ERR empty command")
+        
+
+    command_value = request.array[0]
+    command = command_value.bulk.decode(errors="replace").upper()
+    args = request.array[1:]
+
+    if not command:
+        return Value(typ=RESPType.ERROR, string="ERR empty command")
+        
+    cmd = COMMANDS.get(command)
+    if cmd is None:
+        return Value(typ=RESPType.ERROR, string=f"ERR unknown command '{command}'")
+        
+    if not cmd.arity_ok(len(request.array)):
+        return Value(typ=RESPType.ERROR, string=f"ERR wrong number of arguments for '{command.lower()}' command")
+    try:
+        response = cmd.handler(args)
+        if cmd.write and aof is not None and response.typ != RESPType.ERROR:
+            aof.write(request)
+    except Exception as e:
+        return Value(typ=RESPType.ERROR, string=f"ERR {str(e)}")
+
+    return response
+
+def flush_output(sel: selectors.BaseSelector, client: Client) -> None:
+    # Send what the socket accepts right now.
+    if client.outbuf:
+        try:
+            sent = client.sock.send(client.outbuf)
+            del client.outbuf[:sent]
+        except BlockingIOError:
+            pass # socket full: nothing sent this time
+        except (BrokenPipeError, ConnectionResetError):
+            close_client(sel, client)
+            return
+
+    # Decide what to wait for next
+    if client.outbuf:
+        if client.closing:
+            set_events(sel, client, selectors.EVENT_WRITE)  # only wait to send
+        else:
+            set_events(sel, client, selectors.EVENT_READ | selectors.EVENT_WRITE)
+    elif client.closing:
+        close_client(sel, client)
+    else:
+        set_events(sel, client, selectors.EVENT_READ)
+
+def set_events(sel: selectors.BaseSelector, client: Client, events: int) -> None:
+    if sel.get_key(client.sock).events != events:
+        sel.modify(client.sock, events, data=client)
 
 if __name__ == "__main__":
     run()

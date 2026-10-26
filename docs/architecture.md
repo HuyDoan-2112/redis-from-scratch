@@ -20,9 +20,10 @@ Implemented:
 | --- | --- |
 | `resp.py` | RESP2 parser and encoder for arrays, bulk strings, simple strings, integers, and errors. |
 | `commands/` | `PING`, `SET`, `GET`, `HSET`, `HGET`, and the command table with arity checks and a `write` flag. |
-| `storage/keyspace.py` | One global dict and a lock that hold every key. |
-| `persistence/aof.py` | Append-only file. Writes each `SET`/`HSET`, flushes and fsyncs once per second, replays on startup. |
-| `server.py` | TCP server with one thread per client and a global lock. |
+| `storage/keyspace.py` | One global dict that holds every key. No lock: only the event loop thread touches it. |
+| `persistence/aof.py` | Append-only file. Writes each `SET`/`HSET`, flushes and fsyncs once per second in a background thread, replays on startup. |
+| `server.py` | Single-threaded `selectors` event loop. Reads into each client's input buffer, runs every complete command, and sends replies from its output buffer, registering for write events only while bytes are left. |
+| `client.py` | Per-client state: socket, input buffer, output buffer, and a `closing` flag for closing after an error reply. |
 | `__main__.py` | Command-line options: `--host`, `--port`, `--aof`, `--aof-path`. |
 | `tests/test_aof.py` | 6 tests for AOF crash recovery. |
 
