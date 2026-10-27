@@ -6,6 +6,7 @@ import errno
 import io
 import socket # Import the socket module for network communication
 import selectors
+import signal
 import sys
 
 from mini_redis.config import DEFAULT_CONFIG, ServerConfig
@@ -24,10 +25,14 @@ def replay_command(request: Value) -> None:
     if response.typ == RESPType.ERROR:
         raise ValueError(f"Failed to replay {cmd.name}: {response.string}")
 
+# Signals that stop the server cleanly. SIGBREAK is Ctrl+Break on Windows.
+SHUTDOWN_SIGNALS = [signal.SIGINT, signal.SIGTERM]
+if hasattr(signal, "SIGBREAK"):
+    SHUTDOWN_SIGNALS.append(signal.SIGBREAK)
+
 def listen(config: ServerConfig) -> socket.socket:
     """Open the listening socket, or exit with a short message."""
-    # create_server sets SO_REUSEADDR on Linux and macOS only. On Windows that
-    # option lets a second process bind the same port, so it must stay off.
+    # No SO_REUSEADDR on Windows: there it lets two servers share a port.
     try:
         return socket.create_server(
             (config.host, config.port), backlog=config.listen_backlog
@@ -39,8 +44,7 @@ def listen(config: ServerConfig) -> socket.socket:
         sys.exit(f"Could not listen on {config.host}:{config.port}: {err}")
 
 def run(config: ServerConfig = DEFAULT_CONFIG) -> None:
-    # Bind before loading the AOF, so a second server on the same port exits
-    # before it reads or truncates the first server's AOF file.
+    # Bind first, so a second server exits before touching the AOF.
     lsock = listen(config)
 
     aof = AOF(config.aof) if config.aof.enabled else None
@@ -52,24 +56,59 @@ def run(config: ServerConfig = DEFAULT_CONFIG) -> None:
             lsock.close()
             raise
     sel = selectors.DefaultSelector()
+    lsock.setblocking(False)
+    sel.register(lsock, selectors.EVENT_READ)
+
+    # Signals write a byte to wake_w, so select() returns at once (even on Windows).
+    wake_r, wake_w = socket.socketpair()
+    wake_r.setblocking(False)
+    wake_w.setblocking(False)
+    sel.register(wake_r, selectors.EVENT_READ)
+
+    received: list[int] = []
+    old_handlers = {
+        sig: signal.signal(sig, lambda signum, frame: received.append(signum))
+        for sig in SHUTDOWN_SIGNALS
+    }
+    old_wakeup_fd = signal.set_wakeup_fd(wake_w.fileno())
 
     print(f"Server listening on {config.host}:{config.port}")
 
-    lsock.setblocking(False)
-    sel.register(lsock, selectors.EVENT_READ, data=None)
-
     try:
-        while True:
-            events = sel.select(timeout=None)
-            for key, mask in events:
-                if key.data is None:
-                    accept_wrapper(key.fileobj, sel)
+        while not received:
+            for key, mask in sel.select():
+                if key.fileobj is lsock:
+                    accept_wrapper(lsock, sel)
+                elif key.fileobj is wake_r:
+                    drain(wake_r)
                 else:
                     service_connection(key, mask, sel, aof, config)
-    except KeyboardInterrupt:
-        print("Caught keyboard interrupt, exiting")
+        print(f"Received {signal.Signals(received[0]).name}, shutting down")
     finally:
-        sel.close()
+        signal.set_wakeup_fd(old_wakeup_fd)
+        for sig, handler in old_handlers.items():
+            signal.signal(sig, handler)
+        shutdown(sel, aof)
+        wake_w.close()
+
+
+def drain(sock: socket.socket) -> None:
+    """Read and drop all waiting bytes."""
+    try:
+        while sock.recv(4096):
+            pass
+    except BlockingIOError:
+        pass
+
+
+def shutdown(sel: selectors.BaseSelector, aof: AOF | None) -> None:
+    """Save the AOF, then close all sockets."""
+    if aof is not None:
+        aof.close()  # flush and fsync
+    for key in list(sel.get_map().values()):
+        sel.unregister(key.fileobj)
+        key.fileobj.close()
+    sel.close()
 
 def accept_wrapper(sock: socket.socket, sel: selectors.BaseSelector) -> None:
     try:
