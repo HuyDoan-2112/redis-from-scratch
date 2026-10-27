@@ -1,4 +1,4 @@
-from typing import Any, List, Optional, BinaryIO
+from typing import List, BinaryIO
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -14,7 +14,8 @@ class RESPType(str, Enum):
     NULL = "null"  # Not a real prefix: RESP2 null is written as a null bulk string "$-1\r\n"
 
 CRLF = b"\r\n"
-
+MAX_LINE = 64*1024
+MAX_BULK = 512*1024*1024
 # Define a dataclass to represent a value in the RESP protocol.
 @dataclass
 class Value:
@@ -103,8 +104,11 @@ class RESPReader(object):
         Returns:
             tuple[bytes, int]: A tuple containing the line read (without CRLF) and the number of bytes read.
         """
-        line = self.reader.readline(64*1024) # Read a line with a maximum length of 64KB
+        line = self.reader.readline(MAX_LINE) # Read a line with a maximum length of 64KB
+
         if not line.endswith(b"\n"):
+            if len(line) >= MAX_LINE:
+                raise ValueError("Line too long")
             raise EOFError("Unexpected end of stream")
         if not line.endswith(b"\r\n"):
             raise ValueError("Line does not end with CRLF")
@@ -180,6 +184,8 @@ class RESPReader(object):
         """
         length = self._read_int_line() # Read the length of the bulk string
 
+        if length < -1 or length > MAX_BULK:
+            raise ValueError("Invalid bulk length")
         if length == -1: # A length of -1 indicates a null bulk string
             raise ValueError("Null bulk strings are not supported")
 

@@ -4,23 +4,14 @@ from mini_redis.resp import Value, RESPType
 from mini_redis.storage.keyspace import store
 
 def set_cmd(args: List[Value]) -> Value:
-    if len(args) != 2:
-        return Value(typ=RESPType.ERROR, string="ERR wrong number of arguments for 'set' command")
-    
     key = args[0].bulk
     value = args[1].bulk
-
-    
     store[key] = ("string", value) 
 
     return Value(typ=RESPType.SIMPLE_STRING, string="OK")
 
 def get(args: List[Value]) -> Value:
-    if len(args) != 1:
-        return Value(typ=RESPType.ERROR, string="ERR wrong number of arguments for 'get' command")
-
     key = args[0].bulk
-    
     item = store.get(key)
 
     if item is None:

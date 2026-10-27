@@ -3,16 +3,12 @@ from typing import List
 from mini_redis.resp import Value, RESPType
 from mini_redis.storage.keyspace import store
 
-
 def hset(args: List[Value]) -> Value:
-    if len(args) != 3:
-        return Value(typ=RESPType.ERROR, string="ERR wrong number of arguments for 'hset' command")
-
     hash_key = args[0].bulk
     key = args[1].bulk
     value = args[2].bulk
-
     item = store.get(hash_key)
+
     if item is None:
         hash_map = {}
         store[hash_key] = ("hash", hash_map)
@@ -27,14 +23,10 @@ def hset(args: List[Value]) -> Value:
     return Value(typ=RESPType.INTEGER, num=1 if is_new_key else 0)
 
 def hget(args: List[Value]) -> Value:
-    if len(args) != 2:
-        return Value(typ=RESPType.ERROR, string="ERR wrong number of arguments for 'hget' command")
-
     hash_key = args[0].bulk
     key = args[1].bulk
-
-
     item = store.get(hash_key)
+
     if item is None:
         return Value(typ=RESPType.NULL)  # Return a RESP null value if the hash does not exist.
     typ, hash_map = item

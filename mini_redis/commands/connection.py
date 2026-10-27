@@ -16,4 +16,6 @@ def ping(args: List[Value]) -> Value:
         return Value(typ=RESPType.SIMPLE_STRING, string="PONG")
     
     return Value(typ=RESPType.BULK_STRING, bulk=args[0].bulk)  # Echo back the first argument if provided.
- 
+
+def echo(args: List[Value]) -> Value:
+    return Value(typ=RESPType.BULK_STRING, bulk=args[0].bulk)

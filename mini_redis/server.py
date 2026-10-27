@@ -2,45 +2,56 @@
 Server lifecycle and event loop.
 """
 
+import errno
 import io
 import socket # Import the socket module for network communication
 import selectors
+import sys
 
 from mini_redis.config import DEFAULT_CONFIG, ServerConfig
 from mini_redis.resp import RESPReader, Value, RESPType
-from mini_redis.commands.registry import COMMANDS
+from mini_redis.commands.registry import CommandError, lookup
 from mini_redis.persistence.aof import AOF
 from mini_redis.client import Client
 
 
 def replay_command(request: Value) -> None:
-    if request.typ != RESPType.ARRAY or not request.array:
-        raise ValueError("Invalid command in AOF")
-
-    command = request.array[0].bulk.decode(errors="replace").upper()
-    cmd =  COMMANDS.get(command)
-    if cmd is None or not cmd.write:
-        raise ValueError(f"Unexpected command in AOF: {command}")
+    cmd = lookup(request)
+    if not cmd.write:
+        raise ValueError(f"Unexpected command in AOF: {cmd.name}")
 
     response = cmd.handler(request.array[1:])
     if response.typ == RESPType.ERROR:
-        raise ValueError(f"Failed to replay {command}: {response.string}")
+        raise ValueError(f"Failed to replay {cmd.name}: {response.string}")
+
+def listen(config: ServerConfig) -> socket.socket:
+    """Open the listening socket, or exit with a short message."""
+    # create_server sets SO_REUSEADDR on Linux and macOS only. On Windows that
+    # option lets a second process bind the same port, so it must stay off.
+    try:
+        return socket.create_server(
+            (config.host, config.port), backlog=config.listen_backlog
+        )
+    except OSError as err:
+        if err.errno == errno.EADDRINUSE:
+            sys.exit(f"Could not listen on {config.host}:{config.port}: "
+                     f"port {config.port} is already in use")
+        sys.exit(f"Could not listen on {config.host}:{config.port}: {err}")
 
 def run(config: ServerConfig = DEFAULT_CONFIG) -> None:
+    # Bind before loading the AOF, so a second server on the same port exits
+    # before it reads or truncates the first server's AOF file.
+    lsock = listen(config)
+
     aof = AOF(config.aof) if config.aof.enabled else None
     if aof is not None:
         try:
             aof.read(replay_command)
         except Exception:
             aof.close()
+            lsock.close()
             raise
     sel = selectors.DefaultSelector()
-    lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM) # AF_INET = IPv4, SOCK_STREAM = TCP
-    lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # allow immediate rebinding of the port after restart
-    lsock.bind((config.host, config.port)) # bind the socket to the given host and port
-   
-    # a maximum backlog of connections set in config
-    lsock.listen(config.listen_backlog)
 
     print(f"Server listening on {config.host}:{config.port}")
 
@@ -89,7 +100,7 @@ def service_connection(
             recv_data = sock.recv(config.recv_buffer_size)
         except BlockingIOError:
             return
-        except ConnectionResetError:
+        except OSError:
             close_client(sel, client)
             return
         
@@ -99,8 +110,7 @@ def service_connection(
         client.inbuf += recv_data
         process_input(client, aof)
         flush_output(sel, client)
-
-    if mask & selectors.EVENT_WRITE:
+    elif mask & selectors.EVENT_WRITE:
         flush_output(sel, client)
 
 def process_input(client: Client, aof: AOF | None) -> None:
@@ -127,24 +137,12 @@ def close_client(sel: selectors.BaseSelector, client: Client) -> None:
     client.sock.close()
 
 def execute(request: Value, aof: AOF | None) -> Value:
-
-    if request.typ != RESPType.ARRAY or not request.array:
-        return Value(typ=RESPType.ERROR, string="ERR empty command")
-        
-
-    command_value = request.array[0]
-    command = command_value.bulk.decode(errors="replace").upper()
+    try:
+        cmd = lookup(request)
+    except CommandError as e:
+        return Value(typ=RESPType.ERROR, string=str(e))
+    
     args = request.array[1:]
-
-    if not command:
-        return Value(typ=RESPType.ERROR, string="ERR empty command")
-        
-    cmd = COMMANDS.get(command)
-    if cmd is None:
-        return Value(typ=RESPType.ERROR, string=f"ERR unknown command '{command}'")
-        
-    if not cmd.arity_ok(len(request.array)):
-        return Value(typ=RESPType.ERROR, string=f"ERR wrong number of arguments for '{command.lower()}' command")
     try:
         response = cmd.handler(args)
         if cmd.write and aof is not None and response.typ != RESPType.ERROR:
@@ -162,7 +160,7 @@ def flush_output(sel: selectors.BaseSelector, client: Client) -> None:
             del client.outbuf[:sent]
         except BlockingIOError:
             pass # socket full: nothing sent this time
-        except (BrokenPipeError, ConnectionResetError):
+        except OSError:
             close_client(sel, client)
             return
 
