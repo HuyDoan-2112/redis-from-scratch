@@ -2,12 +2,10 @@
 Server lifecycle and event loop.
 """
 
-import errno
 import io
 import socket # Import the socket module for network communication
 import selectors
 import signal
-import sys
 
 from mini_redis.config import DEFAULT_CONFIG, ServerConfig
 from mini_redis.resp import RESPReader, Value, RESPType
@@ -25,41 +23,28 @@ def replay_command(request: Value) -> None:
     if response.typ == RESPType.ERROR:
         raise ValueError(f"Failed to replay {cmd.name}: {response.string}")
 
-# Signals that stop the server cleanly. SIGBREAK is Ctrl+Break on Windows.
+# Signals that stop the server cleanly.
 SHUTDOWN_SIGNALS = [signal.SIGINT, signal.SIGTERM]
-if hasattr(signal, "SIGBREAK"):
-    SHUTDOWN_SIGNALS.append(signal.SIGBREAK)
-
-def listen(config: ServerConfig) -> socket.socket:
-    """Open the listening socket, or exit with a short message."""
-    # No SO_REUSEADDR on Windows: there it lets two servers share a port.
-    try:
-        return socket.create_server(
-            (config.host, config.port), backlog=config.listen_backlog
-        )
-    except OSError as err:
-        if err.errno == errno.EADDRINUSE:
-            sys.exit(f"Could not listen on {config.host}:{config.port}: "
-                     f"port {config.port} is already in use")
-        sys.exit(f"Could not listen on {config.host}:{config.port}: {err}")
 
 def run(config: ServerConfig = DEFAULT_CONFIG) -> None:
-    # Bind first, so a second server exits before touching the AOF.
-    lsock = listen(config)
-
     aof = AOF(config.aof) if config.aof.enabled else None
     if aof is not None:
         try:
             aof.read(replay_command)
         except Exception:
             aof.close()
-            lsock.close()
             raise
     sel = selectors.DefaultSelector()
+    lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM) # AF_INET = IPv4, SOCK_STREAM = TCP
+    lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # allow immediate rebinding of the port after restart
+    lsock.bind((config.host, config.port)) # bind the socket to the given host and port
+
+    # a maximum backlog of connections set in config
+    lsock.listen(config.listen_backlog)
     lsock.setblocking(False)
     sel.register(lsock, selectors.EVENT_READ)
 
-    # Signals write a byte to wake_w, so select() returns at once (even on Windows).
+    # Signals write a byte to wake_w, so select() returns at once.
     wake_r, wake_w = socket.socketpair()
     wake_r.setblocking(False)
     wake_w.setblocking(False)

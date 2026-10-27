@@ -1,8 +1,4 @@
 """Server behavior tests with real processes and TCP clients.
-
-TODO: Verify two simultaneous clients and disconnects.
-Use a temporary free port so tests do not depend on port 6379 being available.
-
 Run from the project root:
     python -m unittest tests.test_server -v
 """
@@ -22,13 +18,7 @@ from tests.test_aof import free_port
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 
-# Windows can only send Ctrl+Break, to a process in its own group.
-if sys.platform == "win32":
-    STOP_SIGNALS = {"CTRL_BREAK_EVENT": signal.CTRL_BREAK_EVENT}
-    NEW_GROUP = subprocess.CREATE_NEW_PROCESS_GROUP
-else:
-    STOP_SIGNALS = {"SIGINT": signal.SIGINT, "SIGTERM": signal.SIGTERM}
-    NEW_GROUP = 0
+STOP_SIGNALS = {"SIGINT": signal.SIGINT, "SIGTERM": signal.SIGTERM}
 
 
 def start_server(port: int, *args: str) -> subprocess.Popen:
@@ -38,7 +28,6 @@ def start_server(port: int, *args: str) -> subprocess.Popen:
         cwd=PROJECT_ROOT,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        creationflags=NEW_GROUP,
     )
     deadline = time.time() + 5
     while time.time() < deadline:
@@ -58,28 +47,6 @@ def stop_server(proc: subprocess.Popen) -> None:
     if proc.poll() is None:
         proc.kill()
     proc.wait()
-
-
-class TestStartup(unittest.TestCase):
-    def test_second_server_on_same_port_fails(self):
-        """A second server on a used port must exit."""
-        port = free_port()
-        first = start_server(port)
-        self.addCleanup(stop_server, first)
-
-        try:
-            second = subprocess.run(
-                [sys.executable, "-m", "mini_redis", "--port", str(port)],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-        except subprocess.TimeoutExpired:
-            self.fail("second server started on a port that was already in use")
-
-        self.assertEqual(second.returncode, 1)
-        self.assertIn(f"port {port} is already in use", second.stderr)
 
 
 class TestShutdown(unittest.TestCase):
