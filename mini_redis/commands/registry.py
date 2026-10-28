@@ -9,21 +9,28 @@ from mini_redis.commands.hashes import hset, hget
 
 @dataclass(frozen=True)
 class Command:
+    """One entry in the command table, the same idea as Redis's redisCommand."""
+
     name: str
+    # Gets the arguments without the command name, returns the reply.
     handler: Callable[[List[Value]], Value]
-    arity: int # counts the command name, negative means "at least" -1
+    # Number of items including the command name: GET key is 2.
+    # Negative means "at least": -1 is 1 or more (PING, PING msg).
+    arity: int
     write: bool = False # True if the command modifies the store, False if it only reads
 
     def arity_ok(self, n: int) -> bool:
+        """Check the request length `n` (command name included)."""
         return n == self.arity if self.arity > 0 else n >= -self.arity
 
 class CommandError(Exception):
-    pass
+    """A request that cannot run. The message is the RESP error to send."""
 
 def lookup(request: Value) -> Command:
     """Find the command for a request, or raise CommandError"""
     if request.typ != RESPType.ARRAY or not request.array:
         raise CommandError("ERR empty command")
+    # Command names are case-insensitive: "get", "GET" and "Get" all work.
     name = request.array[0].bulk.decode(errors="replace").upper()
     cmd = COMMANDS.get(name)
     if cmd is None:
@@ -32,6 +39,8 @@ def lookup(request: Value) -> Command:
         raise CommandError(f"ERR wrong number of arguments for '{name.lower()}' command")
     return cmd
 
+# To add a command: write its handler, then add one line here.
+# lookup() checks arity first, so handlers can index args without checking.
 cmds = [
     Command("PING", ping, -1),
     Command("ECHO", echo, 2),

@@ -1,4 +1,4 @@
-"""Connection commands: PING."""
+"""Connection commands: PING and ECHO."""
 
 from typing import List
 
@@ -18,4 +18,5 @@ def ping(args: List[Value]) -> Value:
     return Value(typ=RESPType.BULK_STRING, bulk=args[0].bulk)  # Echo back the first argument if provided.
 
 def echo(args: List[Value]) -> Value:
+    """ECHO message: send the message back as a bulk string."""
     return Value(typ=RESPType.BULK_STRING, bulk=args[0].bulk)

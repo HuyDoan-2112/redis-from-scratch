@@ -1,6 +1,6 @@
 """
-    AOF (Append-Only File) is a method that Redis record each command in the file as RESP.
-    When a restart, the server can replay the commands in the AOF file to restore the database state.
+    AOF (Append-Only File): Redis records each write command in a file, in RESP format.
+    On restart, the server replays the commands in the file to rebuild the data.
 """
 import os
 import threading
@@ -12,16 +12,23 @@ from mini_redis.config import AOFConfig
 from mini_redis.resp import Value, RESPReader
 
 class AOF:
+    """The append-only file, fsynced once per interval by a background thread."""
+
     def __init__(self, config: AOFConfig):
         self.config = config
-        self.lock = threading.Lock() # A lock to ensure thread-safe access to the AOF file.
+        # The event loop writes and the sync thread flushes the same file
+        # object, so both must hold this lock.
+        self.lock = threading.Lock()
         self.stop_event = threading.Event() # A flag to indicate whether the AOF file is closed.
 
         Path(config.path).parent.mkdir(parents=True, exist_ok=True) # Ensure the directory for the AOF file exists.
 
         # Python file objects are already buffered, so no seperat bufio.Reader is needed.
         # buffer means a temp holding area in computer memory (RAM) used to store data
-        # while it moves from one place to another. 
+        # while it moves from one place to another.
+        # "a+b": append mode, so every write goes to the end of the file, plus
+        # read access for replaying it at startup. Binary, because keys and
+        # values can be any bytes.
         self.file = open(config.path, "a+b")
         self.sync_thread = threading.Thread(
             target=self._sync_loop, 
@@ -33,10 +40,12 @@ class AOF:
         A background thread that periodically flushes the AOF file to disk.
         This is done to ensure that the data is persisted even if the server crashes.
         """
+        # wait() returns False on timeout (time to sync) and True once
+        # close() sets the event, which ends the loop.
         while not self.stop_event.wait(self.config.sync_interval_secs):
             with self.lock:
-                self.file.flush() # Flush the file buffer to disk.
-                os.fsync(self.file.fileno()) # Ensure the data is written to disk.
+                self.file.flush() # Python's buffer -> OS page cache (not on disk yet).
+                os.fsync(self.file.fileno()) # OS page cache -> disk.
         
 
     def close(self) -> None:
@@ -56,12 +65,23 @@ class AOF:
 
     def write(self, value: Value) -> None:
         """
-            Write the command to AOF file whenever we receive a request from the client.
+            Append one write command to the AOF.
+
+            This only fills Python's buffer, so it is fast. The data reaches
+            disk at the next fsync in _sync_loop(), so a crash can lose up to
+            about one sync interval of writes.
         """
         with self.lock:
             self.file.write(value.marshal())
 
     def read(self, callback: Callable[[Value], None]) -> None:
+        """
+            Replay every command in the file through `callback`.
+
+            A crash in the middle of a write can leave half a command at the
+            end of the file. Cut that tail off, so new writes are not appended
+            after broken bytes.
+        """
         with self.lock:
             self.file.flush()
             self.file.seek(0)

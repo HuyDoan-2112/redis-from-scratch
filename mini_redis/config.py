@@ -24,7 +24,7 @@ class ServerConfig:
     host: str = "127.0.0.1"
     port: int = 6379
     listen_backlog: int = 511  # Same default as Redis tcp-backlog
-    recv_buffer_size: int = 1024
+    recv_buffer_size: int = 1024  # Max bytes read per recv() call on a client socket
     aof: AOFConfig = field(default_factory=AOFConfig)
 
     def __post_init__(self) -> None:

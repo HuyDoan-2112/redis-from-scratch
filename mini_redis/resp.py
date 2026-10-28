@@ -14,11 +14,18 @@ class RESPType(str, Enum):
     NULL = "null"  # Not a real prefix: RESP2 null is written as a null bulk string "$-1\r\n"
 
 CRLF = b"\r\n"
-MAX_LINE = 64*1024
-MAX_BULK = 512*1024*1024
+# Limits that stop a bad or hostile client from making us buffer forever.
+MAX_LINE = 64*1024  # longest header line, e.g. "*3" or "$5"
+MAX_BULK = 512*1024*1024  # largest bulk string, the same 512 MB limit as Redis
 # Define a dataclass to represent a value in the RESP protocol.
 @dataclass
 class Value:
+    """One RESP value. `typ` decides which of the other fields is used:
+
+    SIMPLE_STRING and ERROR use `string`, INTEGER uses `num`,
+    BULK_STRING uses `bulk`, ARRAY uses `array`, NULL uses none.
+    """
+
     typ: str = ""
     string: str = ""
     num: int = 0
@@ -55,7 +62,7 @@ class Value:
 
     def _marshal_bulk(self) -> bytes:
         # $5\r\nhello\r\n
-        # Encode fi rst: the length must count bytes, not characters ("é" is 2 bytes).
+        # The length counts bytes, not characters ("é" is 2 bytes in UTF-8).
         data = self.bulk
         return b"$" + str(len(data)).encode() + CRLF + data + CRLF
 
