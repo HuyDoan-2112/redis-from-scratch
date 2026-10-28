@@ -8,7 +8,7 @@ import selectors
 import signal
 
 from mini_redis.config import DEFAULT_CONFIG, ServerConfig
-from mini_redis.resp import RESPReader, Value, RESPType
+from mini_redis.resp import ProtocolError, RESPReader, Value, RESPType
 from mini_redis.commands.registry import CommandError, lookup
 from mini_redis.persistence.aof import AOF
 from mini_redis.client import Client
@@ -170,13 +170,14 @@ def process_input(client: Client, aof: AOF | None) -> None:
     while True:
         try:
             bio = io.BytesIO(client.inbuf)
-            request = RESPReader(bio).read()
+            request = RESPReader(bio).read_command()
         except EOFError:
             break  # the buffer ends mid-command: wait for the rest
-        except ValueError:
+        except ValueError as e:
             # Bad bytes. We cannot know where the next command starts, so
             # reply once and close, as Redis does.
-            client.outbuf += b"-ERR Protocol error\r\n"
+            detail = f": {e}" if isinstance(e, ProtocolError) else ""
+            client.outbuf += f"-ERR Protocol error{detail}\r\n".encode()
             client.closing = True
             break
 
@@ -191,7 +192,10 @@ def close_client(sel: selectors.BaseSelector, client: Client) -> None:
     client.sock.close()
 
 def execute(request: Value, aof: AOF | None) -> Value:
-    """Run one command and return its reply. Never raises."""
+    """Run one command and return its reply.
+
+    Raises only when a write command crashes, which stops the server.
+    """
     try:
         cmd = lookup(request)
     except CommandError as e:
@@ -200,14 +204,20 @@ def execute(request: Value, aof: AOF | None) -> Value:
     args = request.array[1:]  # drop the command name
     try:
         response = cmd.handler(args)
-        # Log only writes that succeeded. A failed write changed nothing, so
-        # replaying it would only fail again at startup.
-        if cmd.write and aof is not None and response.typ != RESPType.ERROR:
-            aof.write(request)
+    except CommandError as e:
+        # A bad argument from the client, not a bug: reply with the error
+        return Value(typ=RESPType.ERROR, string=str(e))
     except Exception as e:
-        # A bug in one handler must not crash the server for every client.
+        if cmd.write:
+            # The store may be half-changed and the AOF does not know about it.
+            # Stop the server: a restart rebuilds memory from the AOF, which
+            # holds only commands that finished.
+            raise
+        # A read changed nothing, so an error reply is safe.
         return Value(typ=RESPType.ERROR, string=f"ERR {str(e)}")
-
+    # Log only writes that succeeded.
+    if cmd.write and aof is not None and response.typ != RESPType.ERROR:
+        aof.write(request)
     return response
 
 def flush_output(sel: selectors.BaseSelector, client: Client) -> None:

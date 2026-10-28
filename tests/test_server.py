@@ -72,5 +72,40 @@ class TestShutdown(unittest.TestCase):
                 self.assertEqual(aof_path.read_bytes(), cmd_bytes("SET", "a", "1"))
 
 
+class TestProtocolErrors(unittest.TestCase):
+    """Every item in a command must be a bulk string, as in Redis."""
+
+    def test_non_bulk_item_is_rejected_and_connection_closed(self):
+        cases = {
+            "integer": (b":5\r\n", b":"),
+            "simple string": (b"+a\r\n", b"+"),
+            "nested array": (b"*1\r\n$1\r\na\r\n", b"*"),
+        }
+        port = free_port()
+        proc = start_server(port)
+        self.addCleanup(stop_server, proc)
+
+        def connect() -> socket.socket:
+            sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+            self.addCleanup(sock.close)
+            return sock
+
+        setup = connect()
+        setup.sendall(cmd_bytes("SET", "", "v"))
+        self.assertEqual(setup.recv(100), b"+OK\r\n")
+
+        for name, (item, prefix) in cases.items():
+            with self.subTest(item=name):
+                client = connect()
+                client.sendall(b"*2\r\n$3\r\nDEL\r\n" + item)
+                expected = b"-ERR Protocol error: expected '$', got '" + prefix + b"'\r\n"
+                self.assertEqual(client.recv(100), expected)
+                self.assertEqual(client.recv(100), b"", "server did not close the client")
+
+        # The bad DELs must not have run as DEL "".
+        setup.sendall(cmd_bytes("GET", ""))
+        self.assertEqual(setup.recv(100), b"$1\r\nv\r\n")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

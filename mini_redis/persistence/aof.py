@@ -90,7 +90,9 @@ class AOF:
             good_offset = 0
             while True:
                 try:
-                    value = reader.read()
+                    # Same rules as client commands, so the AOF can never
+                    # replay something a client could not have sent.
+                    value = reader.read_command()
                 except EOFError:
                     break
 

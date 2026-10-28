@@ -5,7 +5,8 @@ from mini_redis.resp import RESPType, Value
 from mini_redis.commands.connection import ping, echo
 from mini_redis.commands.strings import set_cmd, get
 from mini_redis.commands.hashes import hset, hget
-
+from mini_redis.commands.keys import del_cmd, exists_cmd, expire_cmd
+from mini_redis.commands.errors import CommandError
 
 @dataclass(frozen=True)
 class Command:
@@ -23,8 +24,6 @@ class Command:
         """Check the request length `n` (command name included)."""
         return n == self.arity if self.arity > 0 else n >= -self.arity
 
-class CommandError(Exception):
-    """A request that cannot run. The message is the RESP error to send."""
 
 def lookup(request: Value) -> Command:
     """Find the command for a request, or raise CommandError"""
@@ -48,5 +47,8 @@ cmds = [
     Command("GET", get, 2),
     Command("HSET", hset, 4, write=True),
     Command("HGET", hget, 3),
+    Command("DEL", del_cmd, -2, write=True),
+    Command("EXISTS", exists_cmd, -2),
+    Command("EXPIRE", expire_cmd, -3, write=True)
 ]
 COMMANDS: dict[str, Command] = {c.name: c for c in cmds}

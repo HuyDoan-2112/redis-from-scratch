@@ -17,6 +17,15 @@ CRLF = b"\r\n"
 # Limits that stop a bad or hostile client from making us buffer forever.
 MAX_LINE = 64*1024  # longest header line, e.g. "*3" or "$5"
 MAX_BULK = 512*1024*1024  # largest bulk string, the same 512 MB limit as Redis
+
+
+class ProtocolError(ValueError):
+    """Bytes that break the rules for a client command.
+
+    The message matches Redis, and the server sends it to the client as
+    "-ERR Protocol error: <message>".
+    """
+    
 # Define a dataclass to represent a value in the RESP protocol.
 @dataclass
 class Value:
@@ -156,6 +165,38 @@ class RESPReader(object):
             raise EOFError("End of stream")
         
         raise ValueError(f"Unsupported RESP type: {resp_type}") # Raise an error for unsupported types
+
+    def read_command(self) -> Value:
+        """
+        Read one client command: an array whose items are all bulk strings.
+
+        read() accepts any RESP value, but a command must be only bulk
+        strings. Otherwise `*2 $3 DEL :5` would reach DEL as an integer
+        Value, whose .bulk is b"", and delete the key "".
+        """
+        resp_type = self.reader.read(1)
+        if resp_type == b"":
+            raise EOFError("End of stream")
+        if resp_type != b"*":
+            # Redis also accepts plain-text "inline" commands (PING\r\n).
+            # Not supported yet.
+            raise ValueError(f"Unsupported RESP type: {resp_type}")
+
+        length = self._read_int_line()
+        if length < 0:
+            raise ValueError("Null array length is not supported")
+
+        array = []
+        for _ in range(length):
+            item_type = self.reader.read(1)
+            if item_type == b"":
+                raise EOFError("Unexpected end of stream")
+            if item_type != b"$":
+                got = item_type.decode(errors="replace")
+                raise ProtocolError(f"expected '$', got '{got}'")
+            array.append(self._read_bulk_string())
+
+        return Value(typ=RESPType.ARRAY, array=array)
 
 
     def _read_array(self) -> Value:
