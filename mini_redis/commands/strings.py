@@ -4,7 +4,7 @@ from mini_redis.resp import Value, RESPType
 from mini_redis.storage.keyspace import expires, lookup_key, store, now_ms
 from mini_redis.commands.args import INT64_MAX, SetOptions, parse_int, parse_set_options
 from mini_redis.commands.errors import CommandError
-
+from mini_redis.propagation import propagate
 
 def set_cmd(args: List[Value]) -> Value:
     """SET key value [NX | XX] [GET] [EX s | PX ms | EXAT t | PXAT t | KEEPTTL]"""
@@ -27,10 +27,16 @@ def set_cmd(args: List[Value]) -> Value:
         if opts.expire_at_ms <= now_ms():
             del store[key]
             expires.pop(key, None)
+            propagate(b"DEL", key) 
         else:
             expires[key] = opts.expire_at_ms
-    elif not opts.keepttl:
-        expires.pop(key, None)  # a new SET starts with no TTL
+            propagate(b"SET", key, value, b"PXAT", str(opts.expire_at_ms).encode())
+    elif opts.keepttl:
+        propagate(b"SET", key, value, b"KEEPTTL")
+    else:
+        expires.pop(key, None)
+        propagate(b"SET", key, value)
+
     return reply_set(opts, old, wrote=True)
 
 def reply_set(opts: SetOptions, value: bytes | None, wrote: bool) -> Value:
@@ -79,4 +85,5 @@ def incr_cmd(args: List[Value]) -> Value:
         raise CommandError("ERR increment or decrement would overflow")
 
     store[key] = ("string", str(curr_value).encode())
+    propagate(b"INCR", key)
     return Value(typ=RESPType.INTEGER, num=curr_value)

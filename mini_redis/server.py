@@ -12,22 +12,7 @@ from mini_redis.resp import ProtocolError, RESPReader, Value, RESPType
 from mini_redis.commands.registry import CommandError, lookup_command
 from mini_redis.persistence.aof import AOF
 from mini_redis.client import Client
-
-
-def replay_command(request: Value) -> None:
-    """Run one command read back from the AOF at startup.
-
-    Only write commands are ever logged, and every logged command succeeded
-    the first time, so anything else means the file is broken: stop instead of
-    starting with wrong data.
-    """
-    cmd = lookup_command(request)
-    if not cmd.write:
-        raise ValueError(f"Unexpected command in AOF: {cmd.name}")
-
-    response = cmd.handler(request.array[1:])
-    if response.typ == RESPType.ERROR:
-        raise ValueError(f"Failed to replay {cmd.name}: {response.string}")
+from mini_redis.propagation import take
 
 # Signals that stop the server cleanly.
 SHUTDOWN_SIGNALS = [signal.SIGINT, signal.SIGTERM]
@@ -100,7 +85,6 @@ def drain(sock: socket.socket) -> None:
             pass
     except BlockingIOError:
         pass
-
 
 def shutdown(sel: selectors.BaseSelector, aof: AOF | None) -> None:
     """Save the AOF, then close all sockets."""
@@ -185,12 +169,27 @@ def process_input(client: Client, aof: AOF | None) -> None:
         del client.inbuf[:bio.tell()]
         client.outbuf += execute(request, aof).marshal()
 
-
 def close_client(sel: selectors.BaseSelector, client: Client) -> None:
     # Unregister first: the selector cannot look up a socket that is closed.
     sel.unregister(client.sock)
     client.sock.close()
 
+def replay_command(request: Value) -> None:
+    """Run one command read back from the AOF at startup.
+
+    Only write commands are ever logged, and every logged command succeeded
+    the first time, so anything else means the file is broken: stop instead of
+    starting with wrong data.
+    """
+    cmd = lookup_command(request)
+    if not cmd.write:
+        raise ValueError(f"Unexpected command in AOF: {cmd.name}")
+
+    response = cmd.handler(request.array[1:])
+    take()
+    if response.typ == RESPType.ERROR:
+        raise ValueError(f"Failed to replay {cmd.name}: {response.string}")
+    
 def execute(request: Value, aof: AOF | None) -> Value:
     """Run one command and return its reply.
 
@@ -202,11 +201,12 @@ def execute(request: Value, aof: AOF | None) -> Value:
         return Value(typ=RESPType.ERROR, string=str(e))
 
     args = request.array[1:]  # drop the command name
+
     try:
         response = cmd.handler(args)
     except CommandError as e:
         # A bad argument from the client, not a bug: reply with the error
-        return Value(typ=RESPType.ERROR, string=str(e))
+        response = Value(typ=RESPType.ERROR, string=str(e))
     except Exception as e:
         if cmd.write:
             # The store may be half-changed and the AOF does not know about it.
@@ -214,10 +214,12 @@ def execute(request: Value, aof: AOF | None) -> Value:
             # holds only commands that finished.
             raise
         # A read changed nothing, so an error reply is safe.
-        return Value(typ=RESPType.ERROR, string=f"ERR {str(e)}")
-    # Log only writes that succeeded.
-    if cmd.write and aof is not None and response.typ != RESPType.ERROR:
-        aof.write(request)
+        response = Value(typ=RESPType.ERROR, string=f"ERR {str(e)}")
+    
+    changes = take()
+    if aof is not None:
+        for change in changes:
+            aof.write(change)
     return response
 
 def flush_output(sel: selectors.BaseSelector, client: Client) -> None:

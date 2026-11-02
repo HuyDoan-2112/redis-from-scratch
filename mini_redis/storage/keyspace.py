@@ -5,6 +5,8 @@
 # No lock is needed: only the event loop thread touches this dict.
 import time
 
+from mini_redis.propagation import propagate
+
 store: dict[bytes, tuple[str, object]] = {}
 
 # Keys that have a TTL, mapped to their deadline in ms since the epoch.
@@ -22,6 +24,7 @@ def lookup_key(key: bytes) -> tuple[str, object] | None:
     if deadline is not None and deadline <= now_ms():
         del store[key]
         del expires[key]
+        propagate(b"DEL", key) 
         return None
 
     return store.get(key)

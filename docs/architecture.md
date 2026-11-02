@@ -238,7 +238,7 @@ Redis removes expired keys in two ways. This server does both.
 Lazy expiry: every read or write of a key first checks `expires`. If the
 deadline has passed, delete the key and act as if it never existed.
 
-Active expiry (the classic Redis algorithm): 10 times a second,
+Active expiry (the classic Redis algorithm): 10 times a second
 
 1. Pick 20 random keys from `expires`.
 2. Delete the ones that have expired.

@@ -5,7 +5,7 @@ from mini_redis.resp import RESPType, Value
 from mini_redis.commands.connection import ping, echo
 from mini_redis.commands.strings import set_cmd, get, incr_cmd
 from mini_redis.commands.hashes import hset, hget
-from mini_redis.commands.keys import del_cmd, exists_cmd, expire_cmd, ttl_cmd
+from mini_redis.commands.keys import del_cmd, exists_cmd, expire_cmd, pexpireat_cmd, ttl_cmd
 from mini_redis.commands.errors import CommandError
 
 @dataclass(frozen=True)
@@ -50,6 +50,7 @@ cmds = [
     Command("DEL", del_cmd, -2, write=True),
     Command("EXISTS", exists_cmd, -2),
     Command("EXPIRE", expire_cmd, -3, write=True),
+    Command("PEXPIREAT", pexpireat_cmd, -3, write=True),
     Command("TTL", ttl_cmd, 2),
     Command("INCR", incr_cmd, 2, write=True)
 ]

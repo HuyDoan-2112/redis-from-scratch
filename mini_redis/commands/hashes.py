@@ -1,15 +1,16 @@
 from typing import List
 
 from mini_redis.resp import Value, RESPType
-from mini_redis.storage.keyspace import store
+from mini_redis.storage.keyspace import lookup_key, store
+from mini_redis.propagation import propagate
 
 def hset(args: List[Value]) -> Value:
     """HSET key field value: set one field. Returns 1 if the field is new, 0 if updated."""
     hash_key = args[0].bulk
     key = args[1].bulk  # the field name inside the hash
     value = args[2].bulk
-    item = store.get(hash_key)
-
+    item = lookup_key(hash_key)
+    
     if item is None:
         # First field: create the hash. The dict is stored by reference, so
         # writing to hash_map below updates the stored hash too.
@@ -22,14 +23,14 @@ def hset(args: List[Value]) -> Value:
 
     is_new_key = key not in hash_map
     hash_map[key] = value  # Set the field in the hash map.
-
+    propagate(b"HSET", hash_key, key, value)
     return Value(typ=RESPType.INTEGER, num=1 if is_new_key else 0)
 
 def hget(args: List[Value]) -> Value:
     """HGET key field: the field's value, or nil if the key or field is missing."""
     hash_key = args[0].bulk
     key = args[1].bulk  # the field name inside the hash
-    item = store.get(hash_key)
+    item = lookup_key(hash_key)
 
     if item is None:
         return Value(typ=RESPType.NULL)  # Return a RESP null value if the hash does not exist.

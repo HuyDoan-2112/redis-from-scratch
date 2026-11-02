@@ -1,0 +1,3 @@
+# Store and check out every text file with Linux line endings (LF), even on
+# Windows, so diffs do not fill up with line-ending changes.
+* text=auto eol=lf
