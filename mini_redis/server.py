@@ -9,7 +9,7 @@ import signal
 
 from mini_redis.config import DEFAULT_CONFIG, ServerConfig
 from mini_redis.resp import ProtocolError, RESPReader, Value, RESPType
-from mini_redis.commands.registry import CommandError, lookup
+from mini_redis.commands.registry import CommandError, lookup_command
 from mini_redis.persistence.aof import AOF
 from mini_redis.client import Client
 
@@ -21,7 +21,7 @@ def replay_command(request: Value) -> None:
     the first time, so anything else means the file is broken: stop instead of
     starting with wrong data.
     """
-    cmd = lookup(request)
+    cmd = lookup_command(request)
     if not cmd.write:
         raise ValueError(f"Unexpected command in AOF: {cmd.name}")
 
@@ -197,7 +197,7 @@ def execute(request: Value, aof: AOF | None) -> Value:
     Raises only when a write command crashes, which stops the server.
     """
     try:
-        cmd = lookup(request)
+        cmd = lookup_command(request)
     except CommandError as e:
         return Value(typ=RESPType.ERROR, string=str(e))
 

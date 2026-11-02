@@ -3,9 +3,9 @@ from dataclasses import dataclass
 
 from mini_redis.resp import RESPType, Value
 from mini_redis.commands.connection import ping, echo
-from mini_redis.commands.strings import set_cmd, get
+from mini_redis.commands.strings import set_cmd, get, incr_cmd
 from mini_redis.commands.hashes import hset, hget
-from mini_redis.commands.keys import del_cmd, exists_cmd, expire_cmd
+from mini_redis.commands.keys import del_cmd, exists_cmd, expire_cmd, ttl_cmd
 from mini_redis.commands.errors import CommandError
 
 @dataclass(frozen=True)
@@ -25,7 +25,7 @@ class Command:
         return n == self.arity if self.arity > 0 else n >= -self.arity
 
 
-def lookup(request: Value) -> Command:
+def lookup_command(request: Value) -> Command:
     """Find the command for a request, or raise CommandError"""
     if request.typ != RESPType.ARRAY or not request.array:
         raise CommandError("ERR empty command")
@@ -39,16 +39,18 @@ def lookup(request: Value) -> Command:
     return cmd
 
 # To add a command: write its handler, then add one line here.
-# lookup() checks arity first, so handlers can index args without checking.
+# lookup_command() checks arity first, so handlers can index args without checking.
 cmds = [
     Command("PING", ping, -1),
     Command("ECHO", echo, 2),
-    Command("SET", set_cmd, 3, write=True),
+    Command("SET", set_cmd, -3, write=True),
     Command("GET", get, 2),
     Command("HSET", hset, 4, write=True),
     Command("HGET", hget, 3),
     Command("DEL", del_cmd, -2, write=True),
     Command("EXISTS", exists_cmd, -2),
-    Command("EXPIRE", expire_cmd, -3, write=True)
+    Command("EXPIRE", expire_cmd, -3, write=True),
+    Command("TTL", ttl_cmd, 2),
+    Command("INCR", incr_cmd, 2, write=True)
 ]
 COMMANDS: dict[str, Command] = {c.name: c for c in cmds}

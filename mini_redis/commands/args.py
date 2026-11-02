@@ -1,8 +1,10 @@
 """Helpers that turn raw command arguments (bytes) into Python values."""
+from dataclasses import dataclass
 from typing import List
 
 from mini_redis.commands.errors import CommandError
 from mini_redis.resp import Value
+from mini_redis.storage.keyspace import now_ms
 
 INT64_MIN = -(2**63)
 INT64_MAX = 2**63 - 1
@@ -49,7 +51,6 @@ def parse_int(raw: bytes) -> int:
 
 EXPIRE_OPTIONS = {b"NX", b"XX", b"GT", b"LT"}
 
-# Helpers
 def parse_expire_options(args: List[Value]) -> set[bytes]:
     """Read NX / XX / GT / LT, rejecting unknown or conflicting options."""
     options = set()
@@ -83,3 +84,85 @@ def expire_allowed(options: set[bytes], current: int | None, deadline: int) -> b
     if b"LT" in options:
         return current is None or deadline < current
     return True
+
+
+SYNTAX_ERROR = "ERR syntax error"
+INVALID_SET_EXPIRE = "ERR invalid expire time in 'set' command"
+
+# SET's expiration options that take a number, and its unit.
+SET_TIME_OPTIONS = {b"EX", b"PX", b"EXAT", b"PXAT"}
+SET_TIME_IN_SECONDS = {b"EX", b"EXAT"}
+SET_TIME_RELATIVE = {b"EX", b"PX"}
+
+
+@dataclass
+class SetOptions:
+    """What SET's options asked for, after parse_set_options checked them."""
+    condition: bytes | None = None   # b"NX", b"XX", or None for "always set"
+    get: bool = False                # reply with the old value instead of OK
+    expire_at_ms: int | None = None  # absolute deadline in ms, from EX/PX/EXAT/PXAT
+    keepttl: bool = False            # leave the key's current TTL alone
+
+
+def parse_set_options(args: List[Value]) -> SetOptions:
+    """Read SET's options: [NX | XX] [GET] [EX | PX | EXAT | PXAT | KEEPTTL].
+
+    Behaves like Redis 8:
+    - Two different options from one group (NX XX, EX 10 KEEPTTL) are a
+      syntax error, but the same option twice is fine and the last one wins.
+    - Every syntax error is reported before a bad number, so the number
+      is only checked after the loop has read all the words.
+    """
+    opts = SetOptions()
+    expire = None    # the expiration option seen: EX, PX, EXAT, PXAT or KEEPTTL
+    raw_time = b""   # its number, still unparsed
+
+    i = 0
+    while i < len(args):
+        word = args[i].bulk.upper()
+
+        if word in (b"NX", b"XX"):
+            if opts.condition not in (None, word):
+                raise CommandError(SYNTAX_ERROR)
+            opts.condition = word
+
+        elif word == b"GET":
+            opts.get = True
+
+        elif word == b"KEEPTTL" or word in SET_TIME_OPTIONS:
+            if expire not in (None, word):
+                raise CommandError(SYNTAX_ERROR)
+            expire = word
+            if word in SET_TIME_OPTIONS:
+                if i + 1 >= len(args):  # "SET k v EX" with no number
+                    raise CommandError(SYNTAX_ERROR)
+                raw_time = args[i + 1].bulk
+                i += 1  # skip the number: it is not an option
+
+        else:
+            raise CommandError(SYNTAX_ERROR)
+        i += 1
+
+    opts.keepttl = expire == b"KEEPTTL"
+    if expire in SET_TIME_OPTIONS:
+        opts.expire_at_ms = set_deadline_ms(expire, parse_int(raw_time))
+    return opts
+
+
+def set_deadline_ms(option: bytes, n: int) -> int:
+    """Turn EX / PX / EXAT / PXAT n into an absolute deadline in ms.
+
+    The deadline may already be in the past (EXAT 1). That is valid:
+    SET still replies OK, and the key expires right away.
+    """
+    if n <= 0:
+        raise CommandError(INVALID_SET_EXPIRE)
+
+    ms = n * 1000 if option in SET_TIME_IN_SECONDS else n
+    if option in SET_TIME_RELATIVE:
+        ms += now_ms()
+
+    # Python ints never overflow, so check the int64 limit by hand.
+    if ms > INT64_MAX:
+        raise CommandError(INVALID_SET_EXPIRE)
+    return ms
