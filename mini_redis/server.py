@@ -1,11 +1,11 @@
 """
 Server lifecycle and event loop.
 """
-
 import io
 import socket # Import the socket module for network communication
 import selectors
 import signal
+import time
 
 from mini_redis.config import DEFAULT_CONFIG, ServerConfig
 from mini_redis.resp import ProtocolError, RESPReader, Value, RESPType
@@ -13,6 +13,8 @@ from mini_redis.commands.registry import CommandError, lookup_command
 from mini_redis.persistence.aof import AOF
 from mini_redis.client import Client
 from mini_redis.propagation import take
+from mini_redis.storage.expire import active_expire_cycle
+from mini_redis.storage.keyspace import now_ms
 
 # Signals that stop the server cleanly.
 SHUTDOWN_SIGNALS = [signal.SIGINT, signal.SIGTERM]
@@ -56,17 +58,23 @@ def run(config: ServerConfig = DEFAULT_CONFIG) -> None:
 
     print(f"Server listening on {config.host}:{config.port}")
 
+    next_cron = time.monotonic()
     try:
         while not received:
+            timeout = max(0.0, next_cron - time.monotonic())
             # Block until at least one socket is ready. `mask` says whether it
             # is ready to read, to write, or both.
-            for key, mask in sel.select():
+            for key, mask in sel.select(timeout):
                 if key.fileobj is lsock:
                     accept_wrapper(lsock, sel)
                 elif key.fileobj is wake_r:
                     drain(wake_r)
                 else:
                     service_connection(key, mask, sel, aof, config)
+            now = time.monotonic()
+            if now >= next_cron:
+                cron(aof, config.hz)
+                next_cron = now + 1.0 / config.hz
         print(f"Received {signal.Signals(received[0]).name}, shutting down")
     finally:
         # Put the old signal setup back, so tests that call run() in a
@@ -113,9 +121,9 @@ def accept_wrapper(sock: socket.socket, sel: selectors.BaseSelector) -> None:
     sel.register(conn, events, data=client)
 
 def service_connection(
-        key: selectors.SelectorKey, 
-        mask: int, 
-        sel: selectors.BaseSelector, 
+        key: selectors.SelectorKey,
+        mask: int,
+        sel: selectors.BaseSelector,
         aof: AOF | None,
         config: ServerConfig
 ) -> None:
@@ -189,7 +197,7 @@ def replay_command(request: Value) -> None:
     take()
     if response.typ == RESPType.ERROR:
         raise ValueError(f"Failed to replay {cmd.name}: {response.string}")
-    
+
 def execute(request: Value, aof: AOF | None) -> Value:
     """Run one command and return its reply.
 
@@ -215,11 +223,8 @@ def execute(request: Value, aof: AOF | None) -> Value:
             raise
         # A read changed nothing, so an error reply is safe.
         response = Value(typ=RESPType.ERROR, string=f"ERR {str(e)}")
-    
-    changes = take()
-    if aof is not None:
-        for change in changes:
-            aof.write(change)
+
+    write_changes(aof)
     return response
 
 def flush_output(sel: selectors.BaseSelector, client: Client) -> None:
@@ -252,6 +257,19 @@ def set_events(sel: selectors.BaseSelector, client: Client, events: int) -> None
     # modify() is a system call (epoll_ctl), so skip it when nothing changes.
     if sel.get_key(client.sock).events != events:
         sel.modify(client.sock, events, data=client)
+
+def write_changes(aof: AOF | None) -> None:
+    """Write all changes that have been recorded since the last call."""
+    changes = take()
+    if aof is not None:
+        for change in changes:
+            aof.write(change)
+
+def cron(aof: AOF | None, hz: int) -> None:
+    """Run periodic tasks, once per tick."""
+    time_limit = 0.25/hz
+    active_expire_cycle(now_ms(), time_limit)
+    write_changes(aof)
 
 if __name__ == "__main__":
     run()

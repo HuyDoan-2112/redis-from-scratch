@@ -1,12 +1,20 @@
 from typing import List
 
 from mini_redis.resp import RESPType, Value
-from mini_redis.storage.keyspace import expires, store, now_ms, lookup_key
+from mini_redis.storage.keyspace import (
+    delete_key,
+    expires,
+    remove_ttl,
+    store,
+    now_ms,
+    lookup_key,
+    set_ttl
+)
 from mini_redis.commands.args import (
-    parse_expire_options, 
-    parse_int, 
-    INT64_MAX, 
-    INT64_MIN, 
+    parse_expire_options,
+    parse_int,
+    INT64_MAX,
+    INT64_MIN,
     expire_allowed
 )
 from mini_redis.commands.errors import CommandError
@@ -23,12 +31,11 @@ def del_cmd(args: List[Value]) -> Value:
         key = arg.bulk
         if lookup_key(key) is not None:
             del store[key]
-            expires.pop(key, None)
+            remove_ttl(key)
             deleted.append(key)
-            
 
     if deleted:
-        propagate(b"DEL", *deleted)  
+        propagate(b"DEL", *deleted)
 
     return Value(typ=RESPType.INTEGER, num=len(deleted))
 
@@ -97,12 +104,10 @@ def apply_deadline(key: bytes, deadline: int, options: set[bytes]) -> Value:
     now = now_ms()
     if deadline <= now:
         # Already in the past: the key expires right away.
-        del store[key]
-        expires.pop(key, None)
-        propagate(b"DEL", key) 
+        delete_key(key)
     else:
-        expires[key] = deadline
-        propagate(b"PEXPIREAT", key, str(deadline).encode())  
+        set_ttl(key, deadline)
+        propagate(b"PEXPIREAT", key, str(deadline).encode())
     return Value(typ=RESPType.INTEGER, num=1)
 
 def ttl_cmd(args: List[Value]) -> Value:
@@ -122,3 +127,7 @@ def ttl_cmd(args: List[Value]) -> Value:
     # lookup_key() already removed expired keys, so ms_left is above 0.
     ms_left = deadline - now_ms()
     return Value(typ=RESPType.INTEGER, num=(ms_left + 500) // 1000)
+
+def dbsize_cmd(args: List[Value]) -> Value:
+    """DBSIZE: how many keys are in the database, of any type."""
+    return Value(typ=RESPType.INTEGER, num=len(store))

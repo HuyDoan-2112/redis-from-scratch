@@ -10,7 +10,7 @@ def hset(args: List[Value]) -> Value:
     key = args[1].bulk  # the field name inside the hash
     value = args[2].bulk
     item = lookup_key(hash_key)
-    
+
     if item is None:
         # First field: create the hash. The dict is stored by reference, so
         # writing to hash_map below updates the stored hash too.
@@ -42,5 +42,5 @@ def hget(args: List[Value]) -> Value:
 
     if value is None:
         return Value(typ=RESPType.NULL)  # Return a RESP null value if the key does not exist in the hash.
-    
+
     return Value(typ=RESPType.BULK_STRING, bulk=value)  # Return the value as a RESP bulk string if the key exists in the hash.

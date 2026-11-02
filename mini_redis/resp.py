@@ -25,7 +25,7 @@ class ProtocolError(ValueError):
     The message matches Redis, and the server sends it to the client as
     "-ERR Protocol error: <message>".
     """
-    
+
 # Define a dataclass to represent a value in the RESP protocol.
 @dataclass
 class Value:
@@ -103,7 +103,7 @@ class RESPReader(object):
             size (int): The number of bytes to read.
         """
         data = bytearray() # Create a mutable bytearray to accumulate the read byte
-        
+
         while len(data) < size: # Keep reading until we have the requested number of bytes
             # request only the bytes we still need to read
             chunk = self.reader.read(size - len(data))
@@ -131,7 +131,7 @@ class RESPReader(object):
 
         return line[:-2], len(line) # Return the line without CRLF and the total number of bytes read
     def _read_int_line(self) -> int:
-        """Read a CRLF-terminated integer payload from the stream.""" 
+        """Read a CRLF-terminated integer payload from the stream."""
         line, _ = self._read_line()
         return int(line)
 
@@ -154,16 +154,16 @@ class RESPReader(object):
         resp_type = self.reader.read(1) # Read the first byte to determine the RESP type
 
         if resp_type == b"*":
-            return self._read_array() 
+            return self._read_array()
         if resp_type == b"$":
-            return self._read_bulk_string() 
+            return self._read_bulk_string()
         if resp_type == b":":
-            return self._read_integer() 
+            return self._read_integer()
         if resp_type == b"+":
-            return self._read_simple_string() 
+            return self._read_simple_string()
         if resp_type == b"":
             raise EOFError("End of stream")
-        
+
         raise ValueError(f"Unsupported RESP type: {resp_type}") # Raise an error for unsupported types
 
     def read_command(self) -> Value:

@@ -31,7 +31,7 @@ class AOF:
         # values can be any bytes.
         self.file = open(config.path, "a+b")
         self.sync_thread = threading.Thread(
-            target=self._sync_loop, 
+            target=self._sync_loop,
             daemon=True
         )
         self.sync_thread.start()
@@ -46,7 +46,7 @@ class AOF:
             with self.lock:
                 self.file.flush() # Python's buffer -> OS page cache (not on disk yet).
                 os.fsync(self.file.fileno()) # OS page cache -> disk.
-        
+
 
     def close(self) -> None:
         """
@@ -106,7 +106,7 @@ class AOF:
                 self.file.seek(good_offset) # Move the file pointer to the end of the truncated file.
 
 
-        
 
 
-        
+
+

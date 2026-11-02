@@ -16,7 +16,7 @@ class AOFConfig:
             raise ValueError("AOF file path must be specified")
         if self.sync_interval_secs <= 0:
             raise ValueError("AOF sync interval must be at least 1 second")
-        
+
 @dataclass(frozen=True)
 class ServerConfig:
     """Configuration values needed to start the server."""
@@ -25,6 +25,7 @@ class ServerConfig:
     port: int = 6379
     listen_backlog: int = 511  # Same default as Redis tcp-backlog
     recv_buffer_size: int = 1024  # Max bytes read per recv() call on a client socket
+    hz: int = 10  # How often to run the server's periodic tasks, in times per second
     aof: AOFConfig = field(default_factory=AOFConfig)
 
     def __post_init__(self) -> None:
@@ -34,6 +35,7 @@ class ServerConfig:
             raise ValueError("listen_backlog must be at least 1")
         if self.recv_buffer_size < 1:
             raise ValueError("recv_buffer_size must be at least 1")
-
+        if not 1 <= self.hz <= 500:
+            raise ValueError("hz must be between 1 and 500")
 
 DEFAULT_CONFIG = ServerConfig()

@@ -1,7 +1,14 @@
 from typing import List
 
 from mini_redis.resp import Value, RESPType
-from mini_redis.storage.keyspace import expires, lookup_key, store, now_ms
+from mini_redis.storage.keyspace import (
+    lookup_key,
+    remove_ttl,
+    set_ttl,
+    store,
+    now_ms,
+    delete_key
+)
 from mini_redis.commands.args import INT64_MAX, SetOptions, parse_int, parse_set_options
 from mini_redis.commands.errors import CommandError
 from mini_redis.propagation import propagate
@@ -25,16 +32,14 @@ def set_cmd(args: List[Value]) -> Value:
     store[key] = ("string", value)
     if opts.expire_at_ms is not None:
         if opts.expire_at_ms <= now_ms():
-            del store[key]
-            expires.pop(key, None)
-            propagate(b"DEL", key) 
+            delete_key(key)
         else:
-            expires[key] = opts.expire_at_ms
+            set_ttl(key, opts.expire_at_ms)
             propagate(b"SET", key, value, b"PXAT", str(opts.expire_at_ms).encode())
     elif opts.keepttl:
         propagate(b"SET", key, value, b"KEEPTTL")
     else:
-        expires.pop(key, None)
+        remove_ttl(key)
         propagate(b"SET", key, value)
 
     return reply_set(opts, old, wrote=True)
@@ -47,7 +52,7 @@ def reply_set(opts: SetOptions, value: bytes | None, wrote: bool) -> Value:
         return Value(typ=RESPType.BULK_STRING, bulk=value)
     if not wrote:
         return Value(typ=RESPType.NULL)
-        
+
     return Value(typ=RESPType.SIMPLE_STRING, string="OK")
 
 def get(args: List[Value]) -> Value:
@@ -57,11 +62,11 @@ def get(args: List[Value]) -> Value:
 
     if item is None:
         return Value(typ=RESPType.NULL)  # Return a RESP null value if the key does not exist.
-    
+
     typ, value = item
     if typ != "string":
         return Value(typ=RESPType.ERROR, string="WRONGTYPE Operation against a key holding the wrong kind of value")  # Return an error if the key is not a string.
-    
+
     return Value(typ=RESPType.BULK_STRING, bulk=value)  # Return the value as a RESP bulk string if the key exists.
 
 def incr_cmd(args: List[Value]) -> Value:

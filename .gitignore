@@ -21,3 +21,5 @@ dist/
 *.egg-info/
 lessons_learned/
 *.aof
+# Private build guides
+docs/aof.md
