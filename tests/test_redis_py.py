@@ -86,6 +86,20 @@ class TestRedisPy(unittest.TestCase):
         self.assertEqual(replies[:100], [True] * 100)
         self.assertEqual(replies[100:], [str(i).encode() for i in range(100)])
 
+    def test_large_value(self):
+        """A 10 MB value arrives in many recv() chunks. Each chunk must not
+        parse the whole command again from the start (that took minutes)."""
+        value = bytes(range(256)) * 40_960  # 10 MB, every byte value, including \r\n
+        self.assertTrue(self.r.set("big:k", value))
+        self.assertEqual(self.r.get("big:k"), value)
+
+    def test_command_with_many_arguments(self):
+        """Same as test_large_value, for one command made of many small arguments."""
+        self.r.set("many:1", "a")
+        self.r.set("many:2", "b")
+        names = ["many:1", "many:2"] + [f"many:missing:{i}" for i in range(100_000)]
+        self.assertEqual(self.r.exists(*names), 2)
+
     def test_two_clients_share_data(self):
         other = self.connect()
         self.addCleanup(other.close)

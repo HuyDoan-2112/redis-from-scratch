@@ -243,3 +243,127 @@ class RESPReader(object):
             raise ValueError("Bulk string not terminated with CRLF")
 
         return Value(typ=RESPType.BULK_STRING, bulk=bulk) # Return a Value object representing the RESP bulk string
+
+
+class CommandParser:
+    """Cuts client commands out of a socket byte stream that arrives in pieces.
+
+    feed() adds bytes as they arrive. next_command() returns the next complete
+    command, or None until more bytes arrive. One recv() can hold half a
+    command or several commands, and the result is the same however the
+    stream is split.
+
+    The parser remembers where it stopped, so each byte is parsed once.
+    Parsing again from the start after every recv() made a 10 MB value take
+    minutes. Redis does the same in processMultibulkBuffer() (networking.c).
+
+    Accepts and rejects exactly what RESPReader.read_command() does, which
+    the AOF loader uses. Change both together (tests/test_resp.py checks that
+    they agree).
+    """
+
+    def __init__(self) -> None:
+        self.buf = bytearray()  # bytes received but not parsed yet
+        self.pos = 0  # how far into buf the current next_command() call got
+        # The command being read. Its finished arguments are kept here, so
+        # their bytes can be dropped from buf.
+        self.args: list[Value] = []
+        self.args_left = 0  # arguments still to read. 0 = between commands
+        self.bulk_len = -1  # length of the next argument. -1 = "$<len>" line not read yet
+
+    def feed(self, data: bytes) -> None:
+        """Add bytes received from the stream."""
+        self.buf += data
+
+    def next_command(self) -> Value | None:
+        """Return the next command: an array whose items are all bulk strings.
+
+        Returns None when the buffer ends before the command does. Raises
+        ValueError (ProtocolError for errors with a Redis message) when the
+        bytes break the rules. After an error the parser cannot continue.
+        """
+        try:
+            return self._parse()
+        finally:
+            # Drop the bytes parsed in this call. What they said is kept in
+            # args, args_left and bulk_len. Deleting from the front of a
+            # bytearray is cheap in CPython: it moves the start pointer.
+            del self.buf[:self.pos]
+            self.pos = 0
+
+    def _parse(self) -> Value | None:
+        buf = self.buf
+        if self.args_left == 0:
+            if self.pos >= len(buf):
+                return None
+            # Check the type byte as soon as it arrives, without waiting for
+            # the rest of the line.
+            if buf[self.pos] != ord("*"):
+                # Redis also accepts plain-text "inline" commands (PING\r\n).
+                # Not supported yet.
+                raise ValueError(f"Unsupported RESP type: {bytes(buf[self.pos:self.pos + 1])}")
+            count = self._read_int_line()
+            if count is None:
+                return None
+            if count < 0:
+                raise ValueError("Null array length is not supported")
+            if count == 0:
+                return self._finish()
+            self.args_left = count
+
+        while self.args_left > 0:
+            if self.bulk_len == -1:
+                if self.pos >= len(buf):
+                    return None
+                # A command must be only bulk strings. Otherwise `*2 $3 DEL :5`
+                # would reach DEL as an integer Value, whose .bulk is b"", and
+                # delete the key "".
+                if buf[self.pos] != ord("$"):
+                    got = bytes(buf[self.pos:self.pos + 1]).decode(errors="replace")
+                    raise ProtocolError(f"expected '$', got '{got}'")
+                length = self._read_int_line()
+                if length is None:
+                    return None
+                if length == -1:
+                    raise ValueError("Null bulk strings are not supported")
+                if length < -1 or length > MAX_BULK:
+                    raise ValueError("Invalid bulk length")
+                self.bulk_len = length
+
+            # The key check: until the whole value and its CRLF are here,
+            # return at once instead of copying a partial value.
+            end = self.pos + self.bulk_len
+            if len(buf) < end + 2:
+                return None
+            if buf[end:end + 2] != CRLF:
+                raise ValueError("Bulk string not terminated with CRLF")
+            self.args.append(Value(typ=RESPType.BULK_STRING, bulk=bytes(buf[self.pos:end])))
+            self.pos = end + 2
+            self.bulk_len = -1
+            self.args_left -= 1
+
+        return self._finish()
+
+    def _read_int_line(self) -> int | None:
+        """Read the integer after a type byte, up to CRLF, and move pos past it.
+
+        Returns None if the line has not fully arrived.
+        """
+        start = self.pos + 1  # skip the type byte
+        # The line, CRLF included, may be at most MAX_LINE bytes.
+        nl = self.buf.find(b"\n", start, start + MAX_LINE)
+        if nl == -1:
+            if len(self.buf) - start >= MAX_LINE:
+                raise ValueError("Line too long")
+            return None
+        if nl == start or self.buf[nl - 1] != ord("\r"):
+            raise ValueError("Line does not end with CRLF")
+        value = int(bytes(self.buf[start:nl - 1]))  # bytes, so errors read as in RESPReader
+        self.pos = nl + 1
+        return value
+
+    def _finish(self) -> Value:
+        """Return the command just completed and get ready for the next one."""
+        command = Value(typ=RESPType.ARRAY, array=self.args)
+        self.args = []
+        return command

@@ -87,16 +87,22 @@ ten commands. One `send()` can accept only part of a reply.
 | Field | Purpose |
 | --- | --- |
 | `sock` | The client socket. |
-| `inbuf: bytearray` | Bytes received but not yet parsed. |
+| `parser: CommandParser` | Holds bytes received but not yet parsed, and how far it got. |
 | `outbuf: bytearray` | Reply bytes not yet sent. |
 | `closing: bool` | Set after a protocol error. Close once `outbuf` is empty. |
 
-The parser works on `inbuf` and returns one of three results:
+The server feeds each `recv()` into the parser, which returns one of three
+results:
 
-- A complete command, plus the number of bytes it used. The server removes
-  those bytes from `inbuf`.
-- "Need more bytes". Keep `inbuf` as it is and wait.
+- A complete command.
+- "Need more bytes" (`None`). Wait for the next `recv()`.
 - A protocol error. Reply with `-ERR Protocol error`, then close.
+
+The parser keeps its progress between calls (arguments read so far, length of
+the next one), so each byte is parsed once. Parsing the whole buffer again
+after every `recv()` made a 10 MB value take minutes. The AOF loader reads a
+file, not a socket, so it uses the simpler `RESPReader`. Both parsers follow
+the same rules, and `tests/test_resp.py` checks that they agree.
 
 Limits: close a client whose `inbuf` or `outbuf` passes a configured size.
 Redis uses 1 GB for input (`client-query-buffer-limit`).

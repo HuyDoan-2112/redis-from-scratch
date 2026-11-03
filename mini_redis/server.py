@@ -1,14 +1,13 @@
 """
 Server lifecycle and event loop.
 """
-import io
 import socket # Import the socket module for network communication
 import selectors
 import signal
 import time
 
 from mini_redis.config import DEFAULT_CONFIG, ServerConfig
-from mini_redis.resp import ProtocolError, RESPReader, Value, RESPType
+from mini_redis.resp import ProtocolError, Value, RESPType
 from mini_redis.commands.registry import CommandError, lookup_command
 from mini_redis.persistence.aof import AOF
 from mini_redis.client import Client
@@ -60,6 +59,7 @@ def run(config: ServerConfig = DEFAULT_CONFIG) -> None:
 
     next_cron = time.monotonic()
     try:
+        pending_writes: set[Client] = set()
         while not received:
             timeout = max(0.0, next_cron - time.monotonic())
             # Block until at least one socket is ready. `mask` says whether it
@@ -70,11 +70,12 @@ def run(config: ServerConfig = DEFAULT_CONFIG) -> None:
                 elif key.fileobj is wake_r:
                     drain(wake_r)
                 else:
-                    service_connection(key, mask, sel, aof, config)
+                    service_connection(key, mask, sel, aof, config, pending_writes)
             now = time.monotonic()
             if now >= next_cron:
                 cron(aof, config.hz)
                 next_cron = now + 1.0 / config.hz
+            before_sleep(sel, aof, pending_writes)
         print(f"Received {signal.Signals(received[0]).name}, shutting down")
     finally:
         # Put the old signal setup back, so tests that call run() in a
@@ -85,6 +86,16 @@ def run(config: ServerConfig = DEFAULT_CONFIG) -> None:
         shutdown(sel, aof)
         wake_w.close()
 
+def before_sleep(sel: selectors.BaseSelector, aof: AOF | None, pending_writes: set[Client]) -> None:
+    """
+    Write this turn's changes to the AOF, then send the replies.
+    AOF first, so a reply never goes out before its write is saved
+    """
+
+    for client in pending_writes:
+        if client.sock.fileno() != -1:
+            flush_output(sel, client)
+    pending_writes.clear()
 
 def drain(sock: socket.socket) -> None:
     """Read and drop all waiting bytes."""
@@ -125,7 +136,8 @@ def service_connection(
         mask: int,
         sel: selectors.BaseSelector,
         aof: AOF | None,
-        config: ServerConfig
+        config: ServerConfig,
+        pending_writes: set[Client]
 ) -> None:
     """Handle one ready client: read and run commands, or send pending replies."""
     client: Client = key.data
@@ -142,29 +154,26 @@ def service_connection(
         if not recv_data:
             close_client(sel, client)  # b"" means the client closed its side
             return
-        # One recv() can hold half a command or several commands, so always
-        # add to the buffer and let process_input() cut out whole commands.
-        client.inbuf += recv_data
-        process_input(client, aof)
-        flush_output(sel, client)
+        process_input(client, recv_data, aof)
+        pending_writes.add(client)
     elif mask & selectors.EVENT_WRITE:
         flush_output(sel, client)
 
-def process_input(client: Client, aof: AOF | None) -> None:
-    """Run every complete command in the input buffer, in order.
+def process_input(client: Client, data: bytes, aof: AOF | None) -> None:
+    """Add received bytes to the client's parser, then run every complete
+    command, in order.
 
-    Replies go to the output buffer. An incomplete command at the end stays in
-    the buffer until more bytes arrive.
+    One recv() can hold half a command or several commands. Replies go to the
+    output buffer. An incomplete command at the end waits in the parser until
+    more bytes arrive.
     """
     if client.closing:
         return  # after a protocol error, ignore anything else the client sends
 
+    client.parser.feed(data)
     while True:
         try:
-            bio = io.BytesIO(client.inbuf)
-            request = RESPReader(bio).read_command()
-        except EOFError:
-            break  # the buffer ends mid-command: wait for the rest
+            request = client.parser.next_command()
         except ValueError as e:
             # Bad bytes. We cannot know where the next command starts, so
             # reply once and close, as Redis does.
@@ -172,9 +181,8 @@ def process_input(client: Client, aof: AOF | None) -> None:
             client.outbuf += f"-ERR Protocol error{detail}\r\n".encode()
             client.closing = True
             break
-
-        # bio.tell() is how many bytes the parser used for this one command.
-        del client.inbuf[:bio.tell()]
+        if request is None:
+            break  # the buffer ends mid-command: wait for the rest
         client.outbuf += execute(request, aof).marshal()
 
 def close_client(sel: selectors.BaseSelector, client: Client) -> None:

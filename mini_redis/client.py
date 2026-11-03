@@ -2,13 +2,16 @@ import socket
 
 from dataclasses import dataclass, field
 
-@dataclass
+from mini_redis.resp import CommandParser
+
+@dataclass(eq=False)
 class Client:
     """per-connection state"""
 
     sock:  socket.socket
-    # Bytes received but not yet parsed. Can end with half a command.
-    inbuf: bytearray = field(default_factory=bytearray)
+    # Turns received bytes into commands. Holds the bytes not parsed yet,
+    # which can end with half a command.
+    parser: CommandParser = field(default_factory=CommandParser)
     # Replies not yet sent. send() may take only part of it at a time.
     outbuf: bytearray = field(default_factory=bytearray)
 
