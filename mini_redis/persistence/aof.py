@@ -12,81 +12,80 @@ from mini_redis.config import AOFConfig
 from mini_redis.resp import Value, RESPReader
 
 class AOF:
-    """The append-only file, fsynced once per interval by a background thread."""
+    """
+    The append-only file.
+
+    Commands collect in memory, and flush() writes them to the file once per
+    event loop turn, before replies go out. When they are fsynced depends on
+    the appendfsync policy: in flush() (always), once per second in a
+    background thread (everysec), or when the OS decides (no).
+    """
 
     def __init__(self, config: AOFConfig):
         self.config = config
-        # The event loop writes and the sync thread flushes the same file
-        # object, so both must hold this lock.
-        self.lock = threading.Lock()
-        self.stop_event = threading.Event() # A flag to indicate whether the AOF file is closed.
+        self.stop_event = threading.Event()  # Set by close() to stop the sync thread.
 
-        Path(config.path).parent.mkdir(parents=True, exist_ok=True) # Ensure the directory for the AOF file exists.
+        Path(config.path).parent.mkdir(parents=True, exist_ok=True)
 
-        # Python file objects are already buffered, so no seperat bufio.Reader is needed.
-        # buffer means a temp holding area in computer memory (RAM) used to store data
-        # while it moves from one place to another.
-        # "a+b": append mode, so every write goes to the end of the file, plus
-        # read access for replaying it at startup. Binary, because keys and
-        # values can be any bytes.
-        self.file = open(config.path, "a+b")
-        self.sync_thread = threading.Thread(
-            target=self._sync_loop,
-            daemon=True
-        )
-        self.sync_thread.start()
+        # O_APPEND: the kernel puts every write at the end of the file.
+        self.fd = os.open(config.path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o644)
+        self.buf = bytearray()
+        self.sync_thread = None
+        if config.appendfsync == "everysec":
+            self.sync_thread = threading.Thread(
+                target=self._sync_loop,
+                daemon=True
+            )
+            self.sync_thread.start()
+
     def _sync_loop(self) -> None:
-        """
-        A background thread that periodically flushes the AOF file to disk.
-        This is done to ensure that the data is persisted even if the server crashes.
-        """
+        """Background thread for everysec: fsync the file once per interval."""
         # wait() returns False on timeout (time to sync) and True once
         # close() sets the event, which ends the loop.
         while not self.stop_event.wait(self.config.sync_interval_secs):
-            with self.lock:
-                self.file.flush() # Python's buffer -> OS page cache (not on disk yet).
-                os.fsync(self.file.fileno()) # OS page cache -> disk.
+            os.fsync(self.fd)
 
+    def _write_all(self, data: bytearray) -> None:
+        """Write all of data to the file. os.write() may write only part of it."""
+        view = memoryview(data)
+        while view:
+            n = os.write(self.fd, view)
+            view = view[n:]
+
+    def flush(self) -> None:
+        """Send the buffer to the kernel, and fsync it if the policy is always."""
+        if not self.buf:
+            return
+        self._write_all(self.buf)
+        self.buf.clear()
+        if self.config.appendfsync == "always":
+            os.fsync(self.fd)
 
     def close(self) -> None:
-        """
-           Close the AOF file and stop the sync thread.
-        """
-        self.stop_event.set() # Signal the sync thread to stop.
-        self.sync_thread.join() # Wait for the sync thread to finish.
-        with self.lock:
-            self.file.flush()
-            os.fsync(self.file.fileno())
-            try:
-                self.file.close()
-            except OSError as err:
-                print(f"failed to close AOF file: {err}")
-                raise
+        """Stop the sync thread, then flush, fsync and close the file."""
+        self.stop_event.set()
+        if self.sync_thread:
+            self.sync_thread.join()
+
+        self.flush()
+        os.fsync(self.fd)
+        os.close(self.fd)
 
     def write(self, value: Value) -> None:
-        """
-            Append one write command to the AOF.
-
-            This only fills Python's buffer, so it is fast. The data reaches
-            disk at the next fsync in _sync_loop(), so a crash can lose up to
-            about one sync interval of writes.
-        """
-        with self.lock:
-            self.file.write(value.marshal())
+        """Add one write command to the buffer. flush() writes it to the file."""
+        self.buf += value.marshal()
 
     def read(self, callback: Callable[[Value], None]) -> None:
         """
-            Replay every command in the file through `callback`.
+        Replay every command in the file through `callback`.
 
-            A crash in the middle of a write can leave half a command at the
-            end of the file. Cut that tail off, so new writes are not appended
-            after broken bytes.
+        A crash in the middle of a write can leave half a command at the
+        end of the file. Cut that tail off, so new writes are not appended
+        after broken bytes.
         """
-        with self.lock:
-            self.file.flush()
-            self.file.seek(0)
-
-            reader = RESPReader(self.file)
+        # RESPReader needs a file object, so read through a separate handle.
+        with open(self.config.path, "rb") as f:
+            reader = RESPReader(f)
             good_offset = 0
             while True:
                 try:
@@ -97,16 +96,11 @@ class AOF:
                     break
 
                 callback(value)
-                good_offset = self.file.tell() # Update the good offset after successfully reading a value.
+                good_offset = f.tell()
 
-            size = self.file.seek(0, os.SEEK_END)
-            if good_offset < size:
-                print(f"truncating AOF file from {size} to {good_offset}")
-                self.file.truncate(good_offset) # Truncate the file to the last good offset to remove any corrupted data.
-                self.file.seek(good_offset) # Move the file pointer to the end of the truncated file.
+            size = f.seek(0, os.SEEK_END)
 
-
-
-
-
-
+        if good_offset < size:
+            print(f"truncating AOF file from {size} to {good_offset}")
+            # O_APPEND makes the next write land at the new end, so no seek.
+            os.ftruncate(self.fd, good_offset)

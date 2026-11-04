@@ -3,6 +3,8 @@
 from dataclasses import dataclass, field
 from pathlib import Path
 
+FSYNC_POLICIES = ("always", "everysec", "no")
+
 @dataclass(frozen=True)
 class AOFConfig:
     """Configuration for the AOF feature of REDIS."""
@@ -10,12 +12,15 @@ class AOFConfig:
     path: Path = Path("appendonly.aof")  # Default AOF file path
     enabled: bool = False  # Whether AOF is enabled
     sync_interval_secs: int = 1  # Interval in seconds to sync AOF to disk
-
+    appendfsync: str = "everysec" # When to fsync: see FSYNC_POLICIES
+    
     def __post_init__(self) -> None:
         if not self.path:
             raise ValueError("AOF file path must be specified")
         if self.sync_interval_secs <= 0:
             raise ValueError("AOF sync interval must be at least 1 second")
+        if self.appendfsync not in FSYNC_POLICIES:
+            raise ValueError(f"appendfsync must be one of {', '.join(FSYNC_POLICIES)}, got {self.appendfsync!r}")
 
 @dataclass(frozen=True)
 class ServerConfig:

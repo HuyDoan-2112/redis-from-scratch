@@ -91,6 +91,8 @@ def before_sleep(sel: selectors.BaseSelector, aof: AOF | None, pending_writes: s
     Write this turn's changes to the AOF, then send the replies.
     AOF first, so a reply never goes out before its write is saved
     """
+    if aof is not None:
+        aof.flush()
 
     for client in pending_writes:
         if client.sock.fileno() != -1:

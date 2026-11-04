@@ -6,7 +6,7 @@ Networking and event-loop behavior live in server.py.
 import argparse
 from pathlib import Path
 
-from mini_redis.config import DEFAULT_CONFIG, AOFConfig, ServerConfig
+from mini_redis.config import DEFAULT_CONFIG, FSYNC_POLICIES, AOFConfig, ServerConfig
 
 
 def parse_args(argv: list[str] | None = None) -> ServerConfig:
@@ -41,6 +41,12 @@ def parse_args(argv: list[str] | None = None) -> ServerConfig:
         default=DEFAULT_CONFIG.aof.path,
         help=f"append-only file location (default: {DEFAULT_CONFIG.aof.path})",
     )
+    parser.add_argument(
+        "--appendfsync",
+        choices=FSYNC_POLICIES,
+        default=DEFAULT_CONFIG.aof.appendfsync,
+        help=f"when to fsync the AOF (default: {DEFAULT_CONFIG.aof.appendfsync})",
+    )
     args = parser.parse_args(argv)
 
     # The config classes are frozen and validate themselves, so build new ones
@@ -49,7 +55,7 @@ def parse_args(argv: list[str] | None = None) -> ServerConfig:
         return ServerConfig(
             host=args.host,
             port=args.port,
-            aof=AOFConfig(enabled=args.aof, path=args.aof_path),
+            aof=AOFConfig(enabled=args.aof, path=args.aof_path, appendfsync=args.appendfsync),
         )
     except ValueError as err:
         parser.error(str(err))

@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 
 from mini_redis.__main__ import parse_args
-
+from mini_redis.config import AOFConfig
 
 class TestParseArgs(unittest.TestCase):
     def test_defaults(self):
@@ -34,6 +34,22 @@ class TestParseArgs(unittest.TestCase):
             parse_args(["--port", "0"])
         self.assertEqual(cm.exception.code, 2)
 
+    def test_appendfsync_default_is_everysec(self):
+        self.assertEqual(parse_args([]).aof.appendfsync, "everysec")
+
+    def test_appendfsync_flag(self):
+        config = parse_args(["--appendfsync", "always"])
+        self.assertEqual(config.aof.appendfsync, "always")
+
+    def test_bad_appendfsync_exits(self):
+        with self.assertRaises(SystemExit) as cm:
+            parse_args(["--appendfsync", "sometimes"])
+        self.assertEqual(cm.exception.code, 2)
+
+    def test_config_rejects_bad_appendfsync(self):
+        # Covers code that builds AOFConfig directly, without argparse.
+        with self.assertRaises(ValueError):
+            AOFConfig(appendfsync="sometimes")
 
 if __name__ == "__main__":
     unittest.main()
