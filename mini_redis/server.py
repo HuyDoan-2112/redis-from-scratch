@@ -280,6 +280,9 @@ def write_changes(aof: AOF | None) -> None:
 
 def cron(aof: AOF | None, hz: int) -> None:
     """Run periodic tasks, once per tick."""
+    if aof is not None:
+        aof.check_rewrite()
+
     time_limit = 0.25/hz
     active_expire_cycle(now_ms(), time_limit)
     write_changes(aof)

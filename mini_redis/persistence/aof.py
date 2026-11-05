@@ -4,6 +4,7 @@
 """
 import os
 import threading
+import signal
 
 from pathlib import Path
 from typing import Callable
@@ -86,6 +87,9 @@ class AOF:
             )
             self.sync_thread.start()
 
+        self.rewrite_pid: int | None = None  # The rewrite child's process ID, None when no rewrite runs.
+        self.rewrite_buf: bytearray | None = None
+
     def _sync_loop(self) -> None:
         """Background thread for everysec: fsync the file once per interval."""
         # wait() returns False on timeout (time to sync) and True once
@@ -104,7 +108,8 @@ class AOF:
             os.fsync(self.fd)
 
     def close(self) -> None:
-        """Stop the sync thread, then flush, fsync and close the file."""
+        """Stop a running rewrite child and the sync thread, then flush, fsync and close the file."""
+        self._kill_rewrite()
         self.stop_event.set()
         if self.sync_thread:
             self.sync_thread.join()
@@ -113,15 +118,8 @@ class AOF:
         os.fsync(self.fd)
         os.close(self.fd)
 
-    def rewrite(self) -> None:
-        """Replace the AOF with the shortest commands that rebuild the current data."""
-        # Buffered commands are already in memory, so they are in the snapshot.
-        # Flush them to the old file first: if the rewrite fails, they are still saved.
-        self.flush()
-
-        path = Path(self.config.path)
-        temp = path.with_name("temp-rewrite.aof") # Same directory, so os.replace is atomic.
-
+    def _write_snapshot(self, temp: Path) -> int:
+        """Write the current data to temp and fsync it. Returns the open fd."""
         fd = os.open(temp, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC, 0o644)
         try:
             _write_all(fd, keyspace_to_commands())
@@ -130,6 +128,11 @@ class AOF:
             os.close(fd)
             os.unlink(temp)
             raise
+        return fd
+
+    def _install(self, fd: int, temp: Path) -> None:
+        """Make temp the AOF and switch self.fd to it."""
+        path = Path(self.config.path)
         os.replace(temp, path)
         _fsync_dir(path.parent)
 
@@ -137,9 +140,74 @@ class AOF:
             old_fd, self.fd = self.fd, fd
             os.close(old_fd)
 
+    def rewrite(self) -> None:
+        """Replace the AOF with the shortest commands that rebuild the current data."""
+        # Buffered commands are already in memory, so they are in the snapshot.
+        # Flush them to the old file first: if the rewrite fails, they are still saved.
+        self.flush()
+
+        temp = self._temp_path()
+
+        fd = self._write_snapshot(temp)
+        self._install(fd, temp)
+
     def write(self, value: Value) -> None:
         """Add one write command to the buffer. flush() writes it to the file."""
-        self.buf += value.marshal()
+        data = value.marshal()
+        self.buf += data
+        if self.rewrite_buf is not None:
+            self.rewrite_buf += data
+
+    def start_rewrite(self) -> None:
+        """Start a rewrite in a child process. Returns right away."""
+        if self.rewrite_pid is not None:
+            raise RuntimeError("Background append only file rewriting already in progress")
+        pid = os.fork()
+        if pid == 0:
+            # Child. It must never return into the server code.
+            try:
+                fd = self._write_snapshot(self._temp_path())
+                os.close(fd)
+                os._exit(0)
+            except BaseException:
+                os._exit(1)
+        self.rewrite_pid = pid
+        self.rewrite_buf = bytearray()
+
+    def check_rewrite(self) -> None:
+        """If the rewrite child has exited, finish or discard its work."""
+        if self.rewrite_pid is None:
+            return
+        pid, status = os.waitpid(self.rewrite_pid, os.WNOHANG)
+        if pid == 0:
+            return
+
+        try:
+            if os.waitstatus_to_exitcode(status) == 0:
+                self._finish_rewrite()
+            else:
+                self._temp_path().unlink(missing_ok=True)
+                print("AOF rewrite child failed")
+        except OSError as err:
+            print(f"AOF rewrite failed: {err}")
+        finally:
+            self.rewrite_pid = None
+            self.rewrite_buf = None
+
+    def _finish_rewrite(self) -> None:
+        """The child wrote the snapshot to temp. Add the writes made since the fork, then swap it in."""
+        self.flush()
+
+        temp = self._temp_path()
+        fd = os.open(temp, os.O_RDWR | os.O_APPEND)
+        try:
+            _write_all(fd, self.rewrite_buf)
+            os.fsync(fd)
+        except BaseException:
+            os.close(fd)
+            os.unlink(temp)
+            raise
+        self._install(fd, temp)
 
     def read(self, callback: Callable[[Value], None]) -> None:
         """
@@ -170,6 +238,21 @@ class AOF:
             print(f"truncating AOF file from {size} to {good_offset}")
             # O_APPEND makes the next write land at the new end, so no seek.
             os.ftruncate(self.fd, good_offset)
+
+    def _temp_path(self) -> Path:
+        """Temp file next to the AOF, so os.replace is atomic."""
+        return Path(self.config.path).with_name("temp-rewrite.aof")
+
+    def _kill_rewrite(self) -> None:
+        """Stop a running rewrite child and delete its unfinished file."""
+        if self.rewrite_pid is None:
+            return
+        os.kill(self.rewrite_pid, signal.SIGKILL)
+        os.waitpid(self.rewrite_pid, 0)
+        self._temp_path().unlink(missing_ok=True)
+        self.rewrite_pid = None
+        self.rewrite_buf = None
+
 
 # The server's AOF, set by server.run(). Command handlers only get args,
 # so BGREWRITEAOF finds the AOF here. None when AOF is off.

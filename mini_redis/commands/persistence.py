@@ -8,5 +8,8 @@ def bgrewriteaof_cmd(args: List[Value]) -> Value:
     """BGREWRITEAOF: replace the AOF with the shortest commands that rebuild the data."""
     if aof.current is None:
         return Value(typ=RESPType.ERROR, string="ERR AOF is not enabled")
-    aof.current.rewrite()
+    try:
+        aof.current.start_rewrite()
+    except RuntimeError as err:
+        return Value(typ=RESPType.ERROR, string=f"ERR {err}")
     return Value(typ=RESPType.SIMPLE_STRING, string="Background append only file rewriting started")
