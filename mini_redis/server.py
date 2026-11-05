@@ -14,6 +14,7 @@ from mini_redis.client import Client
 from mini_redis.propagation import take
 from mini_redis.storage.expire import active_expire_cycle
 from mini_redis.storage.keyspace import now_ms
+from mini_redis.persistence import aof as aof_module
 
 # Signals that stop the server cleanly.
 SHUTDOWN_SIGNALS = [signal.SIGINT, signal.SIGTERM]
@@ -29,6 +30,8 @@ def run(config: ServerConfig = DEFAULT_CONFIG) -> None:
         except Exception:
             aof.close()
             raise
+    aof_module.current = aof
+
     sel = selectors.DefaultSelector()
     lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM) # AF_INET = IPv4, SOCK_STREAM = TCP
     lsock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1) # allow immediate rebinding of the port after restart
