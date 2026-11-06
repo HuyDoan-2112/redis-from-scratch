@@ -12,8 +12,7 @@ import time
 import unittest
 from pathlib import Path
 
-from tests.helpers import cmd_bytes
-from tests.test_aof import free_port
+from tests.helpers import cmd_bytes, free_port
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 

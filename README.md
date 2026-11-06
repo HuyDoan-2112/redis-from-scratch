@@ -54,11 +54,20 @@ Without pipelining, Mini Redis reaches 70% of real Redis on GET at 1,000
 clients. With 16 commands per pipeline, per-command interpreter cost dominates
 and real Redis is 8 to 9 times faster.
 
+With 50 clients and no pipelining, SET reaches 14,083/s with
+`appendfsync always`, 57,078/s with `everysec` and 60,277/s with `no`. During
+`BGREWRITEAOF` with 1M keys under heavy writes, the event loop stops for
+17 ms at the fork and 110 ms at the end, when the parent writes the 76 MB
+rewrite buffer and swaps in the new file. About 26 ms of that end pause is
+closing the old AOF, which makes the kernel free its blocks. See
+[bench/results/2026-11-05-6daa0d2-aof.md](bench/results/2026-11-05-6daa0d2-aof.md).
+
 Reproduce (Linux or WSL, needs `redis-server` and `redis-benchmark`):
 
 ```bash
 python3 bench/run.py            # 3 runs per case, about 10 minutes
 python3 bench/run.py --runs 1   # quick check
+python3 bench/aof.py            # fsync policies and rewrite pauses, about 4 minutes
 ```
 
 ## Quick start
@@ -163,6 +172,7 @@ mini_redis/
 tests/                 unit and end-to-end tests
 bench/
   run.py               benchmark against the old design and real Redis
+  aof.py               fsync policy throughput and BGREWRITEAOF pauses
   results/             saved reports with date, commit and machine
 docs/
   architecture.md      system design

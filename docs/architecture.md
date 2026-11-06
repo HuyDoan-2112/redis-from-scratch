@@ -404,15 +404,21 @@ parsing and command handlers. End-to-end tests start the server as a separate
 process on a free port and talk to it with `redis-py` and with raw sockets.
 
 Crash tests cut bytes off the AOF at chosen points to simulate a crash during a
-write, restart the server, and check the data. Shutdown tests send `SIGINT` and
-`SIGTERM` and check that the AOF is complete and every client is closed.
+write, restart the server, and check the data. Others `SIGKILL` the server
+under each `appendfsync` policy and check that every acknowledged write is
+back after a restart. AOF tests check what each command writes to the file,
+and run `BGREWRITEAOF` with writes during the rewrite, a failing child, and a
+shutdown in the middle. Shutdown tests send `SIGINT` and `SIGTERM` and check
+that the AOF is complete and every client is closed.
 
 `bench/run.py` runs `redis-benchmark` against Mini Redis, the earlier
 thread-per-client version of this server, and real Redis on the same machine,
-with AOF on and off, at 50 and 1,000 clients, with and without pipelining. It
-saves each report under `bench/results/` with the date, commit, CPU, kernel
-and versions. See the [README](../README.md#performance) for the current
-numbers.
+with AOF on and off, at 50 and 1,000 clients, with and without pipelining.
+`bench/aof.py` measures SET throughput for each `appendfsync` policy, and how
+long the event loop stops at the fork and at the end of `BGREWRITEAOF`, using a
+client that sends one `PING` at a time. Both save each report under
+`bench/results/` with the date, commit, CPU, kernel and versions. See the
+[README](../README.md#performance) for the current numbers.
 
 ## 13. Limitations
 

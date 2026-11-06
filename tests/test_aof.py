@@ -1,33 +1,25 @@
-"""Tests for AOF crash recovery.
-
-Scenario we test: the server crashes while writing a command to the AOF,
-so the last command in the file is only half written.
-
-Expected behavior (same as real Redis with aof-load-truncated yes):
-  1. On restart, every complete command is replayed.
-  2. The broken last command is skipped.
-  3. The broken bytes are cut off the file, so new commands are not
-     glued onto them.
-  4. The server can restart again and again after that.
+"""Tests for the AOF class: crash recovery, buffering, fsync policies and
+the background rewrite.
 
 Run from the project root:
     python3 -m unittest tests.test_aof -v
 """
 
+import contextlib
+import io
 import os
-import socket
-import subprocess
-import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from mini_redis.persistence.aof import AOF
-from mini_redis.config import AOFConfig
-from tests.helpers import cmd_bytes, make_cmd, replay
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+from mini_redis.config import AOFConfig, FSYNC_POLICIES
+from mini_redis.server import execute
+from tests.helpers import cmd_bytes, make_cmd, replay, reset_keyspace
 
+FAR_FUTURE_MS = 4102444800000  # 2100-01-01, a deadline that never passes during a test
 
 
 # ---------------------------------------------------------------------------
@@ -35,6 +27,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # ---------------------------------------------------------------------------
 
 class TestAOFRecovery(unittest.TestCase):
+    """The server crashed in the middle of a write, so the last command in
+    the file is only half written. Like Redis with aof-load-truncated yes:
+    every complete command is replayed, the broken tail is skipped and cut
+    off the file, and the server can restart again and again after that."""
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.path = Path(self.tmp.name) / "appendonly.aof"
@@ -78,7 +75,8 @@ class TestAOFRecovery(unittest.TestCase):
 
         # Restart #1: replay, then a client sends SET c 3
         aof = AOF(AOFConfig(path=self.path, enabled=True))
-        aof.read(lambda v: None)
+        with contextlib.redirect_stdout(io.StringIO()):
+            aof.read(lambda v: None)
         aof.write(make_cmd("SET", "c", "3"))
         aof.close()
 
@@ -97,7 +95,8 @@ class TestAOFRecovery(unittest.TestCase):
         self.path.write_bytes(good + full_b[:-5])  # file ends with "...$1"
 
         aof = AOF(AOFConfig(path=self.path, enabled=True))
-        aof.read(lambda v: None)
+        with contextlib.redirect_stdout(io.StringIO()):
+            aof.read(lambda v: None)
         aof.write(make_cmd("SET", "c", "3"))
         aof.close()
 
@@ -109,145 +108,210 @@ class TestAOFRecovery(unittest.TestCase):
         self.assertEqual(commands, [["SET", "a", "1"], ["SET", "c", "3"]])
 
 
-# ---------------------------------------------------------------------------
-# End-to-end test: real server process + real TCP client
-# (the same steps you did by hand with redis-cli)
-# ---------------------------------------------------------------------------
-
-def free_port() -> int:
-    """Ask the OS for a free port so we never clash with a real Redis on 6379."""
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+def wait_for_rewrite(aof: AOF, timeout: float = 5.0) -> None:
+    """Run check_rewrite() the way the server's cron does, until the child is done."""
+    deadline = time.time() + timeout
+    while aof.rewrite_pid is not None:
+        if time.time() > deadline:
+            raise AssertionError("rewrite child did not finish")
+        aof.check_rewrite()
+        time.sleep(0.01)
 
 
-class Client:
-    """A tiny RESP client so the test needs no extra packages."""
-
-    def __init__(self, port: int):
-        self.sock = socket.create_connection(("127.0.0.1", port), timeout=3)
-        self.file = self.sock.makefile("rb")
-
-    def call(self, *parts: str):
-        self.sock.sendall(cmd_bytes(*parts))
-        return self._read_reply()
-
-    def _read_reply(self):
-        line = self.file.readline().rstrip(b"\r\n")
-        kind, rest = line[:1], line[1:]
-        if kind == b"+":
-            return rest.decode()
-        if kind == b"-":
-            raise RuntimeError(rest.decode())
-        if kind == b":":
-            return int(rest)
-        if kind == b"$":
-            length = int(rest)
-            if length == -1:
-                return None  # this is what redis-cli shows as (nil)
-            data = self.file.read(length + 2)
-            return data[:-2].decode()
-        raise RuntimeError(f"unexpected reply: {line!r}")
-
-    def close(self):
-        self.file.close()
-        self.sock.close()
-
-
-class Server:
-    """Start and stop your server as a separate process, with AOF on."""
-
-    def __init__(self, port: int, aof_path: Path):
-        self.port = port
-        self.aof_path = aof_path
-        self.proc = None
-
-    def start(self):
-        code = (
-            "from pathlib import Path\n"
-            "from mini_redis.server import run\n"
-            "from mini_redis.config import ServerConfig, AOFConfig\n"
-            f"run(ServerConfig(port={self.port}, "
-            f"aof=AOFConfig(enabled=True, path=Path({str(self.aof_path)!r}))))\n"
-        )
-        self.proc = subprocess.Popen(
-            [sys.executable, "-c", code],
-            cwd=PROJECT_ROOT,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        # Wait until the port accepts connections, or the process dies.
-        deadline = time.time() + 5
-        while time.time() < deadline:
-            if self.proc.poll() is not None:
-                _, err = self.proc.communicate()
-                raise RuntimeError("server crashed on boot:\n" + err.decode()[-800:])
-            try:
-                socket.create_connection(("127.0.0.1", self.port), timeout=0.2).close()
-                return
-            except OSError:
-                time.sleep(0.05)
-        self.stop()
-        raise RuntimeError("server did not start within 5 seconds")
-
-    def stop(self):
-        if self.proc is None:
-            return
-        time.sleep(1.5)  # the AOF sync thread flushes once per second
-        self.proc.terminate()
-        try:
-            self.proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-            self.proc.wait()
-        self.proc.stdout.close()
-        self.proc.stderr.close()
-        self.proc = None
-
-
-class TestAOFEndToEnd(unittest.TestCase):
+class AOFTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.aof_path = Path(self.tmp.name) / "appendonly.aof"
-        self.server = Server(free_port(), self.aof_path)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        self.path = self.dir / "appendonly.aof"
+        self.closed: list[AOF] = []
+        reset_keyspace()
+        self.addCleanup(reset_keyspace)
 
-    def tearDown(self):
-        self.server.stop()
-        self.tmp.cleanup()
+    def open_aof(self, appendfsync: str = "no") -> AOF:
+        aof = AOF(AOFConfig(path=self.path, enabled=True, appendfsync=appendfsync))
+        self.addCleanup(lambda: aof in self.closed or aof.close())
+        return aof
 
-    def _client(self) -> Client:
-        c = Client(self.server.port)
-        self.addCleanup(c.close)
-        return c
+    def close(self, aof: AOF) -> None:
+        """AOF.close() may run only once, so cleanup skips AOFs closed here."""
+        aof.close()
+        self.closed.append(aof)
 
-    def test_crash_recovery_like_redis_cli(self):
-        # Step 1-2: start, write two keys, stop
-        self.server.start()
-        c = self._client()
-        self.assertEqual(c.call("SET", "a", "1"), "OK")
-        self.assertEqual(c.call("SET", "b", "2"), "OK")
-        c.close()
-        self.server.stop()
+    def record_fsyncs(self) -> mock.Mock:
+        """Watch os.fsync (a system call) and still let it run."""
+        patcher = mock.patch.object(os, "fsync", wraps=os.fsync)
+        fsync = patcher.start()
+        self.addCleanup(patcher.stop)
+        return fsync
 
-        # Step 3: simulate a crash mid-write (same as: truncate -s -5 appendonly.aof)
-        size = self.aof_path.stat().st_size
-        os.truncate(self.aof_path, size - 5)
 
-        # Step 4: restart; b is lost, a is still there; then write c
-        self.server.start()
-        c = self._client()
-        self.assertEqual(c.call("GET", "a"), "1")
-        self.assertIsNone(c.call("GET", "b"))  # (nil)
-        self.assertEqual(c.call("SET", "c", "3"), "OK")
-        c.close()
-        self.server.stop()
+class TestBuffer(AOFTest):
+    def test_write_reaches_the_file_only_on_flush(self):
+        aof = self.open_aof()
+        aof.write(make_cmd("SET", "a", "1"))
+        aof.write(make_cmd("SET", "b", "2"))
+        self.assertEqual(self.path.read_bytes(), b"")
 
-        # Step 5: restart again -> must boot, with a and c
-        self.server.start()  # raises "server crashed on boot" if the bug is there
-        c = self._client()
-        self.assertEqual(c.call("GET", "a"), "1")
-        self.assertIsNone(c.call("GET", "b"))
-        self.assertEqual(c.call("GET", "c"), "3")
+        aof.flush()
+
+        self.assertEqual(self.path.read_bytes(), cmd_bytes("SET", "a", "1") + cmd_bytes("SET", "b", "2"))
+
+    def test_close_flushes_and_fsyncs_with_every_policy(self):
+        for policy in FSYNC_POLICIES:
+            with self.subTest(appendfsync=policy):
+                self.path.unlink(missing_ok=True)
+                with mock.patch.object(os, "fsync", wraps=os.fsync) as fsync:
+                    aof = self.open_aof(policy)
+                    fd = aof.fd
+                    aof.write(make_cmd("SET", "a", "1"))
+
+                    self.close(aof)
+
+                self.assertEqual(self.path.read_bytes(), cmd_bytes("SET", "a", "1"))
+                fsync.assert_any_call(fd)
+
+
+class TestFsyncPolicy(AOFTest):
+    def test_always_fsyncs_on_every_flush(self):
+        fsync = self.record_fsyncs()
+        aof = self.open_aof("always")
+
+        aof.write(make_cmd("SET", "a", "1"))
+        aof.flush()
+        self.assertEqual(fsync.call_count, 1)
+        fsync.assert_called_with(aof.fd)
+
+        aof.flush()  # nothing buffered: no write, no fsync
+        self.assertEqual(fsync.call_count, 1)
+
+        aof.write(make_cmd("SET", "b", "2"))
+        aof.flush()
+        self.assertEqual(fsync.call_count, 2)
+
+    def test_everysec_fsyncs_in_the_background(self):
+        fsync = self.record_fsyncs()
+        aof = self.open_aof("everysec")
+
+        aof.write(make_cmd("SET", "a", "1"))
+        aof.flush()
+        self.assertEqual(fsync.call_count, 0, "flush() itself must not fsync")
+
+        deadline = time.time() + 2
+        while fsync.call_count == 0 and time.time() < deadline:
+            time.sleep(0.05)
+        fsync.assert_called_with(aof.fd)
+
+    def test_no_never_fsyncs_before_close(self):
+        fsync = self.record_fsyncs()
+        aof = self.open_aof("no")
+
+        aof.write(make_cmd("SET", "a", "1"))
+        aof.flush()
+        time.sleep(1.2)  # longer than the everysec interval
+
+        self.assertEqual(fsync.call_count, 0)
+        self.assertEqual(self.path.read_bytes(), cmd_bytes("SET", "a", "1"))
+
+
+class TestBackgroundRewrite(AOFTest):
+    """BGREWRITEAOF forks a child that writes the data to a temp file. The
+    server keeps logging writes, and cron swaps the temp file in once the
+    child is done."""
+
+    def do(self, *commands: str) -> None:
+        for command in commands:
+            execute(make_cmd(*command.split()), self.aof)
+
+    def setUp(self):
+        super().setUp()
+        self.aof = self.open_aof()
+
+    def test_rewrite_keeps_only_the_commands_that_rebuild_the_data(self):
+        self.do("INCR n", "INCR n", "INCR n", "SET a 1", "SET a 2", "HSET h f v",
+                 f"SET t v PXAT {FAR_FUTURE_MS}", "SET gone x", "DEL gone")
+        self.aof.flush()
+
+        self.aof.start_rewrite()
+        wait_for_rewrite(self.aof)
+
+        self.assertEqual(
+            self.path.read_bytes(),
+            cmd_bytes("SET", "n", "3")
+            + cmd_bytes("SET", "a", "2")
+            + cmd_bytes("HSET", "h", "f", "v")
+            + cmd_bytes("SET", "t", "v")
+            + cmd_bytes("PEXPIREAT", "t", str(FAR_FUTURE_MS)),
+        )
+        self.assertEqual(list(self.dir.glob("temp-*")), [])
+
+    def test_writes_made_during_the_rewrite_are_kept(self):
+        self.do("SET a 1")
+        self.aof.flush()
+
+        self.aof.start_rewrite()
+        self.do("SET b 2", "DEL a")  # the child does not see these
+        self.aof.flush()
+        wait_for_rewrite(self.aof)
+
+        self.do("SET c 3")  # goes to the new file
+        self.close(self.aof)
+
+        self.assertEqual(replay(self.path), [
+            ["SET", "a", "1"],
+            ["SET", "b", "2"],
+            ["DEL", "a"],
+            ["SET", "c", "3"],
+        ])
+
+    def test_expired_keys_are_left_out(self):
+        self.do("SET short v PX 30", "SET keep v")
+        time.sleep(0.05)  # short has expired, but nothing has deleted it yet
+
+        self.aof.start_rewrite()
+        wait_for_rewrite(self.aof)
+
+        self.assertEqual(self.path.read_bytes(), cmd_bytes("SET", "keep", "v"))
+
+    def test_second_rewrite_while_one_runs_is_refused(self):
+        self.aof.start_rewrite()
+
+        with self.assertRaisesRegex(RuntimeError, "already in progress"):
+            self.aof.start_rewrite()
+        wait_for_rewrite(self.aof)
+
+    def test_failed_rewrite_keeps_the_old_file(self):
+        self.do("SET a 1")
+        self.aof.flush()
+        # A directory where the temp file should go makes the child fail.
+        blocker = self.dir / "temp-rewrite.aof"
+        blocker.mkdir()
+
+        self.aof.start_rewrite()
+        with contextlib.redirect_stdout(io.StringIO()):
+            wait_for_rewrite(self.aof)
+
+        self.do("SET b 2")
+        self.aof.flush()
+        self.assertEqual(self.path.read_bytes(), cmd_bytes("SET", "a", "1") + cmd_bytes("SET", "b", "2"))
+
+        # Once the problem is gone, a new rewrite works.
+        blocker.rmdir()
+        self.aof.start_rewrite()
+        wait_for_rewrite(self.aof)
+        self.assertEqual(self.path.read_bytes(), cmd_bytes("SET", "a", "1") + cmd_bytes("SET", "b", "2"))
+
+    def test_close_during_rewrite_stops_the_child(self):
+        self.do("SET a 1")
+        self.aof.start_rewrite()
+        pid = self.aof.rewrite_pid
+
+        self.close(self.aof)
+
+        with self.assertRaises(ChildProcessError):
+            os.waitpid(pid, os.WNOHANG)  # already reaped: no zombie left
+        self.assertEqual(list(self.dir.glob("temp-*")), [])
+        self.assertEqual(self.path.read_bytes(), cmd_bytes("SET", "a", "1"))
 
 
 if __name__ == "__main__":

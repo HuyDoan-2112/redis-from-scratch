@@ -1,9 +1,17 @@
-
+import contextlib
+import io
+import socket
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 from mini_redis.persistence.aof import AOF
 from mini_redis.config import AOFConfig
 from mini_redis.resp import Value, RESPType
+from mini_redis.storage import keyspace
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -31,7 +39,123 @@ def replay(path: Path) -> list[list[str]]:
     seen: list[list[str]] = []
     aof = AOF(AOFConfig(path=path, enabled=True))
     try:
-        aof.read(lambda v: seen.append([item.bulk.decode() for item in v.array]))
+        # read() prints a line when it cuts a broken tail. Keep test output clean.
+        with contextlib.redirect_stdout(io.StringIO()):
+            aof.read(lambda v: seen.append([item.bulk.decode() for item in v.array]))
     finally:
         aof.close()
     return seen
+
+
+def reset_keyspace() -> None:
+    """Empty the global store, for tests that run commands in this process."""
+    keyspace.store.clear()
+    keyspace.expires.clear()
+    keyspace.ttl_keys.clear()
+    keyspace.ttl_pos.clear()
+
+
+def free_port() -> int:
+    """Ask the OS for a free port so we never clash with a real Redis on 6379."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class Client:
+    """A tiny RESP client so the tests need no extra packages."""
+
+    def __init__(self, port: int):
+        self.sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+        self.file = self.sock.makefile("rb")
+
+    def call(self, *parts: str):
+        self.sock.sendall(cmd_bytes(*parts))
+        return self._read_reply()
+
+    def pipeline(self, commands: list[tuple[str, ...]]) -> list:
+        """Send all commands at once, then read one reply per command."""
+        self.sock.sendall(b"".join(cmd_bytes(*c) for c in commands))
+        return [self._read_reply() for _ in commands]
+
+    def _read_reply(self):
+        line = self.file.readline().rstrip(b"\r\n")
+        kind, rest = line[:1], line[1:]
+        if kind == b"+":
+            return rest.decode()
+        if kind == b"-":
+            raise RuntimeError(rest.decode())
+        if kind == b":":
+            return int(rest)
+        if kind == b"$":
+            length = int(rest)
+            if length == -1:
+                return None  # this is what redis-cli shows as (nil)
+            data = self.file.read(length + 2)
+            return data[:-2].decode()
+        raise RuntimeError(f"unexpected reply: {line!r}")
+
+    def close(self):
+        self.file.close()
+        self.sock.close()
+
+
+class Server:
+    """Run `python -m mini_redis` as a separate process, the way a user does."""
+
+    def __init__(self, port: int, log_path: Path, *args: str):
+        self.port = port
+        self.args = args
+        self.log_path = log_path  # stdout and stderr, shown if the server fails to boot
+        self.proc: subprocess.Popen | None = None
+
+    def start(self) -> None:
+        with open(self.log_path, "ab") as log:
+            self.proc = subprocess.Popen(
+                [sys.executable, "-m", "mini_redis", "--port", str(self.port), *self.args],
+                cwd=PROJECT_ROOT,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+        # Wait until the port accepts connections, or the process dies.
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            if self.proc.poll() is not None:
+                self.proc = None
+                raise RuntimeError("server crashed on boot:\n" + self.log()[-800:])
+            try:
+                socket.create_connection(("127.0.0.1", self.port), timeout=0.2).close()
+                return
+            except OSError:
+                time.sleep(0.05)
+        self.kill()
+        raise RuntimeError("server did not start within 5 seconds")
+
+    def stop(self) -> int | None:
+        """SIGTERM: a clean shutdown that flushes and fsyncs the AOF. Returns the exit code."""
+        if self.proc is None:
+            return None
+        self.proc.terminate()
+        try:
+            code = self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait()
+            raise RuntimeError("server did not stop within 5 seconds")
+        finally:
+            self.proc = None
+        return code
+
+    def kill(self) -> None:
+        """SIGKILL: a crash, with no chance to flush anything."""
+        if self.proc is None:
+            return
+        self.proc.kill()
+        self.proc.wait()
+        self.proc = None
+
+    def client(self) -> Client:
+        return Client(self.port)
+
+    def log(self) -> str:
+        return self.log_path.read_text(errors="replace")

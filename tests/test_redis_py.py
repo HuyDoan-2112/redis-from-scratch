@@ -9,7 +9,7 @@ import unittest
 
 import redis
 
-from tests.test_aof import free_port
+from tests.helpers import free_port
 from tests.test_server import start_server, stop_server
 
 
