@@ -1,482 +1,435 @@
-# Mini Redis architecture
+# Architecture
 
-Mini Redis is a Redis-compatible server written in Python. It speaks RESP2, so
-`redis-cli` and `redis-py` can talk to it. The goal is to learn how Redis works
-inside: the event loop, the protocol, expiry, persistence, and data structures.
-Later phases add vector search, probabilistic structures, replication, and a
-C++ extension.
+Mini Redis is a Redis-compatible key-value server written in Python with no
+third-party runtime dependencies. It speaks RESP2, so `redis-cli`, `redis-py`
+and `redis-benchmark` work against it unchanged. This document describes how
+the server is built: the event loop, the protocol layer, command execution, the
+keyspace, expiry, persistence and replication.
 
-This document has three parts:
+![Mini Redis architecture](img/architecture-light.png)
 
-1. Where the code is today.
-2. The target design.
-3. The roadmap, in four phases.
+Solid lines are implemented. Dashed lines and components marked "planned" are
+designed but not yet merged. Sections 9 and 10 give their status.
 
-## 1. Where the code is today
+## Contents
 
-Implemented:
+1. [Design principles](#1-design-principles)
+2. [Event loop](#2-event-loop)
+3. [Connections and buffers](#3-connections-and-buffers)
+4. [Protocol](#4-protocol)
+5. [Command execution](#5-command-execution)
+6. [Keyspace and expiry](#6-keyspace-and-expiry)
+7. [Change propagation](#7-change-propagation)
+8. [Append-only file](#8-append-only-file)
+9. [RDB snapshots](#9-rdb-snapshots)
+10. [Replication](#10-replication)
+11. [Error replies](#11-error-replies)
+12. [Testing and benchmarks](#12-testing-and-benchmarks)
+13. [Limitations](#13-limitations)
 
-| File | What works |
+## 1. Design principles
+
+One thread owns the data. A single event loop serves every client and runs
+every command from start to finish before it starts the next one. `INCR` is
+atomic without locks, and no command can see another command half done. This
+is the same model Redis uses, and the GIL does not limit it, because the server
+never runs Python code on two threads at once.
+
+Work that would block the loop runs elsewhere. The `everysec` fsync runs in a
+background thread. AOF rewrites and RDB snapshots run in a forked child
+process, which gets a copy-on-write view of the keyspace at the moment of the
+fork.
+
+The server saves a write before its reply leaves. The loop writes all of a turn's
+changes to the AOF, then sends that turn's replies. A client never sees `OK`
+for a write that is not yet in the file.
+
+Keys and values stay `bytes` from the socket to the keyspace and back.
+The server decodes only command names, integers and option keywords. Any byte
+sequence is a valid key or value.
+
+Each layer has one job. `server.py` holds no command names, command handlers
+never touch sockets, and the persistence code reads changes from one log
+instead of from each handler.
+
+| Module | Responsibility |
 | --- | --- |
-| `resp.py` | RESP2 parser and encoder for arrays, bulk strings, simple strings, integers, and errors. |
-| `commands/` | `PING`, `SET`, `GET`, `HSET`, `HGET`, and the command table with arity checks and a `write` flag. |
-| `storage/keyspace.py` | One global dict that holds every key. No lock: only the event loop thread touches it. |
-| `persistence/aof.py` | Append-only file. Writes each `SET`/`HSET`, flushes and fsyncs once per second in a background thread, replays on startup. |
-| `server.py` | Single-threaded `selectors` event loop. Reads into each client's input buffer, runs every complete command, and sends replies from its output buffer, registering for write events only while bytes are left. |
-| `client.py` | Per-client state: socket, input buffer, output buffer, and a `closing` flag for closing after an error reply. |
-| `__main__.py` | Command-line options: `--host`, `--port`, `--aof`, `--aof-path`. |
-| `tests/test_aof.py` | 6 tests for AOF crash recovery. |
+| `server.py` | Event loop, accept, read, write, cron, shutdown |
+| `client.py` | Per-connection state: socket, parser, output buffer |
+| `resp.py` | RESP2 encoder, incremental socket parser, file reader for AOF replay |
+| `commands/` | Command table and one handler per command |
+| `storage/keyspace.py` | The data, TTLs, lazy expiry, O(1) TTL sampling |
+| `storage/expire.py` | Active expiry cycle |
+| `propagation.py` | Log of changes made by the running command |
+| `persistence/aof.py` | AOF buffer, fsync policies, replay, crash recovery, rewrite |
+| `config.py` | Frozen, validated server and AOF settings |
+| `__main__.py` | Command-line options |
 
-## 2. Target design
+## 2. Event loop
 
-### 2.1 One thread owns the data
+The loop is built on `selectors.DefaultSelector`, which uses epoll on Linux and
+kqueue on macOS. One turn of the loop does this:
 
-Redis runs every command on one thread. This server does the same:
+1. Wait on the selector. The timeout is the time until the next cron tick, so
+   periodic work runs even when no client sends anything.
+2. For each ready socket:
+   - The listener is readable. Accept the client, make its socket
+     non-blocking, and register it for read events.
+   - The wakeup socket is readable. A signal arrived. Drain the socket.
+   - A client is readable. Read up to 16 KB, feed it to the client's parser,
+     and run every complete command in it.
+   - A client is writable. Send as much of its output buffer as the kernel
+     accepts.
+3. If a cron tick is due, run it. Cron runs `hz` times per second (10 by
+   default). It checks whether an AOF rewrite child has exited and runs the
+   active expiry cycle.
+4. Run `before_sleep()`. It writes the turn's buffered AOF data to the file,
+   then sends the pending replies of every client that sent commands this
+   turn.
 
-- One event loop, built on `selectors.DefaultSelector` (epoll on Linux).
-- One thread owns the keyspace. A command runs from start to finish before the
-  next one starts, so `INCR` is atomic without locks.
-- Background work that would block the loop (fsync, snapshots) runs in a
-  separate thread or a forked child process.
-
-Python's GIL does not hurt this design. Redis is single-threaded by choice, and
-the GIL only blocks running Python code in two threads at the same time.
-
-```mermaid
-flowchart LR
-    C1[Client 1] <--> L
-    C2[Client 2] <--> L
-    C3[Client N] <--> L
-    L[Event loop<br/>selectors] --> P[RESP parser]
-    P --> T[Command table]
-    T --> K[(Keyspace)]
-    T --> A[AOF writer]
-    L --> E[Timers:<br/>active expiry, fsync]
-    A -.fsync thread.-> D[(Disk)]
+```text
+select(timeout = next cron tick)
+  ├─ accept new clients
+  ├─ read → parse → execute → append reply to outbuf
+  ├─ send leftover output for writable clients
+  ├─ cron: rewrite child status, active expiry
+  └─ before_sleep: AOF write (+ fsync if always), then send replies
 ```
 
-### 2.2 Event loop
+Shutdown is signal-driven. `SIGINT` and `SIGTERM` handlers only record the
+signal. `signal.set_wakeup_fd()` writes a byte to a socket pair that the
+selector watches, so `select()` returns at once. The loop then exits, stops any
+rewrite child, flushes and fsyncs the AOF, closes every socket, and exits with
+code 0.
 
-Each loop turn:
+## 3. Connections and buffers
 
-1. Wait on the selector. The timeout is the time until the next timer is due,
-   so expiry runs even when no client sends anything.
-2. For each ready socket:
-   - Listener readable: accept the new client, set it non-blocking, register it.
-   - Client readable: read into its input buffer, then parse and run every
-     complete command in the buffer.
-   - Client writable: send as much of its output buffer as the socket accepts.
-3. Run due timers (active expiry, AOF fsync for `everysec`).
-
-Rules:
-
-- All sockets are non-blocking. `BlockingIOError` means "try again on the next
-  event", not an error.
-- Register a client for write events only while its output buffer has bytes.
-  Otherwise the loop spins at 100% CPU.
-- Cap the commands run per client per turn (for example 100) so one busy client
-  cannot starve the others.
-
-### 2.3 Connections and buffers
-
-TCP is a byte stream. One `recv()` can return half a command, one command, or
-ten commands. One `send()` can accept only part of a reply.
-
-`client.py` holds the state for one client:
+TCP is a byte stream. One `recv()` can return half a command or ten commands,
+and one `send()` can accept part of a reply. Each client keeps its own state in
+`Client`:
 
 | Field | Purpose |
 | --- | --- |
-| `sock` | The client socket. |
-| `parser: CommandParser` | Holds bytes received but not yet parsed, and how far it got. |
-| `outbuf: bytearray` | Reply bytes not yet sent. |
-| `closing: bool` | Set after a protocol error. Close once `outbuf` is empty. |
+| `sock` | The non-blocking client socket |
+| `parser` | A `CommandParser` holding bytes received but not yet parsed |
+| `outbuf` | Reply bytes not yet sent |
+| `closing` | Set after a protocol error. The server closes the client once `outbuf` is empty |
 
-The server feeds each `recv()` into the parser, which returns one of three
-results:
+Clients register for write events only while `outbuf` has bytes. A socket with
+nothing to send would otherwise report writable on every turn and spin the
+loop at 100% CPU. The server calls `selector.modify()` (one `epoll_ctl`) only
+when the event mask changes.
+
+`BlockingIOError` from `recv()`, `send()` or `accept()` means "try again on a
+later event". `ECONNRESET`, other socket errors, and a zero-byte read close the
+client. The listen backlog is 511, the Redis `tcp-backlog` default.
+
+## 4. Protocol
+
+Requests are RESP2 arrays of bulk strings. Replies use simple strings, errors,
+integers, bulk strings, null bulk strings and arrays.
+
+`CommandParser` turns the socket stream into commands. It keeps its progress
+between `feed()` calls (arguments read so far, arguments left, and the length
+of the next bulk string), so it reads each byte once. A parser that restarts
+from the beginning of the buffer on every `recv()` is O(n²) on a large value.
+At 16 KB per read, a 10 MB value took minutes. Redis uses the same approach in
+`processMultibulkBuffer()`.
+
+The parser returns one of three results:
 
 - A complete command.
-- "Need more bytes" (`None`). Wait for the next `recv()`.
-- A protocol error. Reply with `-ERR Protocol error`, then close.
+- `None`, meaning the buffer ends mid-command. The bytes stay buffered until
+  the next read.
+- A `ProtocolError`. The server replies `-ERR Protocol error: <reason>` and
+  closes the connection once the reply has gone out, because it can no longer find
+  where the next command starts.
 
-The parser keeps its progress between calls (arguments read so far, length of
-the next one), so each byte is parsed once. Parsing the whole buffer again
-after every `recv()` made a 10 MB value take minutes. The AOF loader reads a
-file, not a socket, so it uses the simpler `RESPReader`. Both parsers follow
-the same rules, and `tests/test_resp.py` checks that they agree.
+The AOF loader reads from a file, so it uses the simpler blocking
+`RESPReader`. Both parsers accept and reject the same inputs, and
+`tests/test_resp.py` checks that they agree. A header line can be at most
+64 KB and a bulk string at most 512 MB, the same limit as Redis
+`proto-max-bulk-len`.
 
-Limits: close a client whose `inbuf` or `outbuf` passes a configured size.
-Redis uses 1 GB for input (`client-query-buffer-limit`).
+## 5. Command execution
 
-### 2.4 Protocol
-
-- RESP2 arrays of bulk strings for requests.
-- Inline commands (`PING\r\n`) so `telnet` works.
-- Keys and values stay as `bytes` from the parser to the keyspace. Decode only
-  for logging.
-
-### 2.5 Command table
-
-Each command is one entry in a table, as in Redis's `commands.def`:
+Each command is one entry in the command table in `commands/registry.py`, the
+same idea as `redisCommandTable` in Redis:
 
 ```python
 @dataclass(frozen=True)
 class Command:
-    name: bytes          # b"SET"
-    handler: Callable    # handler(db, args) -> reply
-    arity: int           # 3 means exactly 3 args incl. name; -3 means at least 3
-    flags: frozenset     # {"write"}, {"readonly"}, {"fast"}
+    name: str
+    handler: Callable[[list[Value]], Value]  # args without the name -> reply
+    arity: int     # 2 means exactly 2 items incl. the name; -2 means at least 2
+    write: bool = False
 ```
 
-The server only does this:
+For every request, `execute()`:
 
-1. Look up the command. If missing, reply `-ERR unknown command`.
-2. Check arity. If wrong, reply `-ERR wrong number of arguments`.
-3. Call the handler.
-4. If the command has the `write` flag and it succeeded, append it to the AOF.
+1. Looks up the command by name, case-insensitive. A missing name replies
+   `-ERR unknown command`.
+2. Checks arity. A wrong count replies `-ERR wrong number of arguments`.
+3. Calls the handler. A `CommandError` from the handler, such as `WRONGTYPE`
+   or a bad integer, becomes an error reply.
+4. Collects the changes the handler recorded and appends them to the AOF
+   buffer.
 
-No command names appear in `server.py`.
+An unexpected exception in a read command becomes an error reply. In a write
+command it stops the server. The keyspace may be half changed while the AOF
+has no record of it, and a restart rebuilds the data from the AOF, which only
+holds commands that finished.
 
-### 2.6 Keyspace
+Supported commands:
+
+| Group | Commands |
+| --- | --- |
+| Connection | `PING`, `ECHO` |
+| Strings | `SET` (with `NX`, `XX`, `GET`, `EX`, `PX`, `EXAT`, `PXAT`, `KEEPTTL`), `GET`, `INCR` |
+| Hashes | `HSET`, `HGET` |
+| Keys | `DEL`, `EXISTS`, `EXPIRE` (with `NX`, `XX`, `GT`, `LT`), `PEXPIREAT`, `TTL`, `DBSIZE` |
+| Persistence | `BGREWRITEAOF` |
+
+Adding a command means writing a handler and adding one line to the table.
+
+## 6. Keyspace and expiry
 
 ```python
-class Keyspace:
-    data: dict[bytes, RedisObject]   # key -> value
-    expires: dict[bytes, int]        # key -> deadline in ms since epoch
+store:    dict[bytes, tuple[str, object]]  # key -> (type tag, data)
+expires:  dict[bytes, int]                 # key -> deadline, ms since epoch
+ttl_keys: list[bytes]                      # keys with a TTL, any order
+ttl_pos:  dict[bytes, int]                 # key -> index in ttl_keys
 ```
 
-`RedisObject` holds a type tag (`string`, `hash`, `zset`, `vectorset`, ...)
-and the value. Keeping deadlines in a separate dict makes active expiry cheap:
-it samples only keys that have a TTL.
+The type tag (`"string"` or `"hash"`) lets commands reply `WRONGTYPE` when a
+key holds the wrong kind of value. Deadlines are absolute milliseconds, so a
+TTL means the same thing after a restart.
 
-### 2.7 Error replies
+The server removes expired keys in two ways, as Redis does.
+
+Lazy expiry runs on access. Every lookup goes through `lookup_key()`, which
+deletes the key if its deadline has passed and reports it as missing.
+
+Active expiry runs on cron, for keys that nobody reads again. Each cycle:
+
+1. Samples 20 keys from `ttl_keys`.
+2. Deletes the ones that have expired.
+3. Repeats while more than 5 of the 20 (25%) were expired.
+4. Every 16 rounds, checks the clock and stops once it has used 25% of a cron
+   tick (25 ms at `hz 10`), so the loop never stalls on a large backlog.
+
+Sampling a random key from a dict needs `list(d)`, which is O(n). `ttl_keys`
+and `ttl_pos` make sampling O(1) per key. Removing a TTL swaps the last key
+into the freed slot, so removal is also O(1).
+
+## 7. Change propagation
+
+Handlers record each change by calling `propagate()` at the moment they change
+the data. After each command, the server calls `take()` and passes the
+recorded changes to the AOF. Replication reads the same log (section 10).
+
+Each change is recorded as a command that gives the same result whenever it
+is replayed, not as the command the client sent:
+
+| Client sends | Recorded as |
+| --- | --- |
+| `EXPIRE k 10` | `PEXPIREAT k <deadline ms>` |
+| `SET k v EX 10` | `SET k v PXAT <deadline ms>` |
+| `SET k v` with a deadline in the past | `DEL k` |
+| A key expires, lazily or actively | `DEL k` |
+| `DEL a b c` where only `a` exists | `DEL a` |
+
+Replaying the AOF next week therefore gives the same data as running the
+commands today. A key that expired before the restart stays deleted.
+
+## 8. Append-only file
+
+### Write path
+
+`AOF.write()` appends the RESP bytes of each change to an in-memory buffer.
+`before_sleep()` calls `AOF.flush()` once per loop turn, which writes the
+buffer with `os.write()` on a file opened with `O_APPEND`. Then the replies go
+out. One write per turn instead of one per command keeps the cost of
+pipelined and concurrent writes low.
+
+### fsync policies
+
+The `--appendfsync` option matches the Redis setting of the same name:
+
+| Policy | When fsync runs | Data lost in a power failure |
+| --- | --- | --- |
+| `always` | In `flush()`, before the server sends the turn's replies | None that a client saw acknowledged |
+| `everysec` (default) | Once per second, in a background thread | Up to about 1 second of writes |
+| `no` | When the kernel decides | Up to the kernel's writeback interval |
+
+A crash of the server process alone loses nothing under any policy once
+`flush()` has returned, because the data is already in the kernel page cache.
+
+### Startup and crash recovery
+
+On startup, before the listener opens, the server replays the AOF through the
+command table. Clients never see a half-loaded dataset. The loader uses the
+same parsing rules as client input, so the AOF cannot replay something a
+client could not have sent. The loader accepts only write commands, and stops
+the server if one fails, because either case means the file is damaged.
+
+A crash in the middle of `os.write()` can leave half a command at the end of
+the file. The loader replays every complete command, then truncates the file at
+the end of the last good one, so new writes are not appended after broken
+bytes.
+
+### Rewrite (`BGREWRITEAOF`)
+
+The AOF grows with every write. `INCR counter` run a million times leaves a
+million entries for one key. A rewrite replaces the file with the shortest list
+of commands that rebuilds the current data: one `SET` per string key, one
+`HSET` per hash field, and a `PEXPIREAT` per key with a TTL.
+
+1. The parent forks. The child serializes its copy-on-write view of the
+   keyspace to `temp-rewrite.aof`, fsyncs it, and exits.
+2. The parent keeps serving clients. It writes every new change to the
+   current AOF as usual, and also copies it to a rewrite buffer.
+3. Cron checks the child with `waitpid(WNOHANG)`. When the child exits with
+   status 0, the parent appends the rewrite buffer to the temp file, fsyncs it,
+   swaps it in with `os.replace()`, and fsyncs the directory.
+4. The parent switches its file descriptor to the new file under a lock shared
+   with the fsync thread.
+
+`os.replace()` is atomic on POSIX. A crash at any point leaves either the old
+complete AOF or the new complete AOF. If the child fails, the parent deletes
+the temp file and keeps the old AOF. Shutdown kills a running child and
+removes its temp file.
+
+Redis 7 and later splits the AOF into a base file, incremental files and a
+manifest. Mini Redis keeps a single file, which needs no manifest and still
+gives the same crash guarantees.
+
+## 9. RDB snapshots
+
+Status: in progress.
+
+`BGSAVE` writes the whole dataset to one binary file, `dump.rdb`. Snapshots are
+smaller and faster to load than an AOF, and replication uses them for a full
+sync.
+
+1. The parent forks. The child sees the data as it was at the fork.
+2. The child writes every key to `temp.rdb`, fsyncs it, and exits.
+3. The parent keeps serving clients. Cron reaps the child with
+   `waitpid(WNOHANG)`, then the parent renames `temp.rdb` to `dump.rdb` with
+   `os.replace()` and fsyncs the directory.
+
+File format:
+
+```text
+"MINIRDB" | version u8 | record* | EOF u8 | CRC32 u32 of all previous bytes
+record    = type u8 | expire_ms i64 (-1 = none) | key_len u32 | key | value
+value     = string: len u32 | bytes
+            hash:   count u32 | (field_len u32 | field | value_len u32 | value)*
+```
+
+The loader rejects a file with a bad magic, an unknown version or a CRC
+mismatch, and skips keys whose deadline has passed. On startup, the server
+loads the AOF if AOF is on, because the AOF is the more complete record.
+Otherwise it loads `dump.rdb` if it exists.
+
+CPython's reference counting writes to every object it touches, which breaks
+copy-on-write page sharing sooner than in C. Calling `gc.freeze()` before the
+fork moves existing objects out of the garbage collector's reach, so a GC pass
+in the parent does not touch every page. The snapshot benchmark measures fork
+time and memory growth for 1M keys with and without it.
+
+## 10. Replication
+
+Status: in progress.
+
+A replica keeps a full copy of the master's data and applies the master's
+write stream. The protocol follows Redis PSYNC.
+
+```text
+replica                                  master
+   │  REPLICAOF host port                   │
+   │──── PING, REPLCONF, PSYNC <id> <off> ─▶│
+   │                                         │ id and offset still in backlog?
+   │◀──── +CONTINUE, then missing bytes ─────│   yes: partial resync
+   │◀──── +FULLRESYNC <id> <off>, RDB ───────│   no:  full sync
+   │◀──── write commands (RESP) ─────────────│ propagate() → backlog → replicas
+   │──── REPLCONF ACK <offset> every 1 s ───▶│
+```
+
+Full sync. The master starts a `BGSAVE` and buffers new writes for the
+replica. It sends the RDB file as a bulk payload, then the buffered writes,
+then the live stream. The replica clears its data, loads the RDB, and applies
+the stream.
+
+Command stream. The master sends every change from the propagation log
+(section 7) to each replica, in the same RESP form it writes to the AOF. The
+replica runs each command through its own command table without sending
+replies back.
+
+Offsets and backlog. The master has a replication ID and an offset, the total
+bytes of the command stream it has produced. It keeps the last 1 MB of the
+stream in a ring buffer. The replica tracks the offset it has applied and
+reports it with `REPLCONF ACK`.
+
+Partial resync. After a disconnect, the replica sends
+`PSYNC <replication id> <offset + 1>`. If the ID matches and the offset is
+still in the backlog, the master replies `+CONTINUE` and sends only the bytes
+the replica missed. Otherwise it falls back to a full sync.
+
+Replicas are read-only and reject write commands from clients. The replica
+connection is one more non-blocking socket in the event loop, so replication
+adds no threads.
+
+Fault-injection tests run master and replica as real processes with a TCP
+proxy between them. The proxy drops, pauses and cuts the link. The tests check
+that the replica matches the master after recovery, and that a short outage
+ends in a partial resync, not a full one.
+
+## 11. Error replies
 
 | Situation | Reply | Connection |
 | --- | --- | --- |
-| Incomplete request | none, wait | open |
-| Malformed RESP | `-ERR Protocol error` | close |
-| Unknown command | `-ERR unknown command 'X'` | open |
-| Wrong number of args | `-ERR wrong number of arguments for 'x' command` | open |
-| Wrong type | `-WRONGTYPE Operation against a key holding the wrong kind of value` | open |
-| Not an integer (INCR) | `-ERR value is not an integer or out of range` | open |
-
-### 2.8 Target layout
-
-```text
-mini_redis/
-  __main__.py          argparse: --port, --aof, --appendfsync, --dir
-  config.py
-  server.py            event loop, timers, shutdown
-  client.py            per-client buffers
-  resp.py              parser and encoder
-  commands/
-    registry.py        Command table
-    connection.py      PING ECHO
-    strings.py         SET GET INCR ...
-    keys.py            DEL EXISTS EXPIRE TTL TYPE
-    hashes.py
-    zsets.py           (phase 3)
-    vectors.py         (phase 3)
-    probabilistic.py   (phase 3)
-  storage/
-    keyspace.py
-    expiry.py
-    skiplist.py        (phase 3)
-    hnsw.py            (phase 3)
-    bloom.py cms.py hll.py   (phase 3)
-  persistence/
-    aof.py
-    rdb.py             (phase 2)
-  replication.py       (phase 3)
-tests/
-bench/                 benchmark scripts and saved results
-```
-
-## 3. Roadmap
-
-```mermaid
-flowchart LR
-    P1[Phase 1<br/>Foundation] --> P2[Phase 2<br/>Core Redis]
-    P2 --> Z[3a Skip list ZSET]
-    Z --> V[3b Vector sets HNSW]
-    V --> S[3c Semantic cache]
-    P2 --> B[3d Bloom, CMS, HLL]
-    P2 --> R[3e Replication]
-    P2 --> X[3f C++ RESP parser]
-```
-
-Each step has a "done when" check. A step is finished only when that check is
-an automated test or a saved benchmark result.
-
-### Phase 1: Foundation
-
-Move to the target design before adding features.
-
-| Step | Work | Done when |
-| --- | --- | --- |
-| 1.1 | Keys and values as `bytes` | `SET k "\xff\xfe"` then `GET k` returns the same bytes. |
-| 1.2 | `selectors` event loop and `client.py` buffers | A command split across two `send()` calls works. 100 clients connected at once, one idle client does not block the others. |
-| 1.3 | Command table with arity and flags | `server.py` contains no command names. |
-| 1.4 | `__main__.py` with argparse | `python -m mini_redis --aof` starts with AOF on. |
-| 1.5 | Clean shutdown on SIGINT and SIGTERM | AOF is flushed and fsynced, all sockets closed, exit code 0. |
-| 1.6 | Compatibility tests with `redis-py` | The test suite uses `redis.Redis(port=...)` against this server. |
-| 1.7 | First benchmark | `redis-benchmark -t set,get -n 100000` results saved in `bench/` for this server and for real Redis on the same machine. |
-
-### Phase 2: Core Redis
-
-#### 2.1 Commands
-
-| Command | Notes |
-| --- | --- |
-| `DEL key [key ...]` | Returns the number of keys removed. |
-| `EXISTS key [key ...]` | Counts a key twice if it is given twice, as Redis does. |
-| `EXPIRE key seconds` | Returns 1 if set, 0 if the key does not exist. |
-| `TTL key` | -2 if the key does not exist, -1 if it has no TTL. |
-| `INCR key` | Error if the value is not a 64-bit integer. Creates the key with 1 if missing. |
-| `SET key value [EX s \| PX ms] [NX \| XX]` | `NX`: only set if missing. `XX`: only set if present. Returns nil when the condition fails. A plain `SET` removes any old TTL. |
-
-Done when: each command has tests for its normal case, missing key, wrong type,
-and wrong arguments, and the replies match real Redis byte for byte.
-
-#### 2.2 Expiry
-
-Redis removes expired keys in two ways. This server does both.
-
-Lazy expiry: every read or write of a key first checks `expires`. If the
-deadline has passed, delete the key and act as if it never existed.
-
-Active expiry (the classic Redis algorithm): 10 times a second
-
-1. Pick 20 random keys from `expires`.
-2. Delete the ones that have expired.
-3. If more than 25% of them were expired, repeat from step 1.
-4. Stop after 25 ms so the loop is never blocked for long.
-
-Without active expiry, keys that are never read again would stay in memory
-forever.
-
-Done when:
-
-- A key with `PX 50` returns nil after 60 ms.
-- After setting 100,000 keys with a 1 s TTL and never reading them, memory use
-  goes back down within a few seconds.
-
-Note: picking a random key from a dict needs `list(d)`, which is O(n). Keep a
-list of keys with TTLs next to the dict, and remove by swapping with the last
-item so removal is O(1).
-
-#### 2.3 AOF done properly
-
-fsync policies, as in Redis's `appendfsync` setting:
-
-| Policy | When fsync runs | Data lost on a crash | Speed |
-| --- | --- | --- | --- |
-| `always` | After every write command, before the reply | At most the command being written | Slowest |
-| `everysec` | Once per second, in a background thread | Up to about 1 second of writes | Default |
-| `no` | When the OS decides (often about 30 s on Linux) | Up to that interval | Fastest |
-
-AOF rewrite (`BGREWRITEAOF`). The AOF grows forever: `INCR counter` run a
-million times writes a million lines for one key. A rewrite replaces it with
-the shortest list of commands that rebuilds the current data.
-
-1. `os.fork()`. The child writes one command per key (`SET`, `HSET`,
-   `PEXPIREAT` for TTLs) to `temp-rewrite.aof`.
-2. While the child runs, the parent keeps serving clients and also copies every
-   new write command into a rewrite buffer.
-3. When the child exits, the parent appends the rewrite buffer to the temp file,
-   fsyncs it, and uses `os.replace()` to swap it in. `os.replace` is atomic on
-   POSIX, so a crash leaves either the old file or the new one, never half of
-   each.
-
-Real Redis 7 and later uses a multi-part AOF (a base file plus incremental
-files and a manifest). The single-file version above is simpler and teaches the
-same ideas.
-
-Done when:
-
-- A crash test passes for each fsync policy.
-- After 1,000,000 `INCR`s on one key, `BGREWRITEAOF` shrinks the file to under
-  100 bytes, and a restart gives the same value.
-- Writes that arrive during the rewrite are not lost.
-
-#### 2.4 RDB snapshots with fork
-
-`BGSAVE` writes the whole dataset to one binary file.
-
-1. `os.fork()`. The OS gives the child a copy of the parent's memory, but
-   shares the pages until one side writes to them (copy-on-write). The fork is
-   fast even with a large dataset.
-2. The child sees the data frozen at the moment of the fork. It writes
-   everything to `temp.rdb`, fsyncs, and exits.
-3. The parent keeps serving clients. When it sees the child exit
-   (`os.waitpid` with `WNOHANG` in a timer), it renames `temp.rdb` to
-   `dump.rdb`.
-4. On startup, load `dump.rdb` if it exists, then replay the AOF.
-
-File format (custom, not compatible with real Redis RDB):
-
-```text
-magic "MINIRDB" | version u8 | records ... | EOF marker | CRC32 of all bytes
-record = type u8 | expiry ms i64 (or -1) | key length u32 | key | value
-```
-
-Things to measure and write about: fork time and memory growth during a
-snapshot while clients keep writing. CPython's reference counting writes to
-every object it touches, which breaks copy-on-write sharing faster than in C.
-`gc.freeze()` before forking helps. Measure the difference.
-
-`os.fork()` exists only on Linux and macOS, not on Windows.
-
-Done when:
-
-- `BGSAVE`, kill the server, restart: all keys and TTLs are back.
-- A flipped byte in `dump.rdb` is caught by the CRC check.
-- Fork time and memory growth for 1M keys are saved in `bench/`.
-
-### Phase 3: Deep areas
-
-Do all six, in this order. 3a must come before 3b, and replication (3e) needs
-RDB from phase 2.
-
-#### 3a. Sorted sets with a skip list
-
-Commands: `ZADD`, `ZSCORE`, `ZRANK`, `ZRANGE` (by index), `ZRANGEBYSCORE`,
-`ZREM`, `ZCARD`.
-
-Structure: a dict (member to score) for O(1) `ZSCORE`, plus a skip list ordered
-by (score, member) for ranges. Each node gets a random level, with p = 0.25
-and a max level of 32, the same values Redis uses. Store a span on every
-forward pointer so `ZRANK` runs in O(log n).
-
-Done when: 100,000 random operations give the same results as a sorted Python
-list, and `ZRANK` timing grows like log n in a benchmark.
-
-#### 3b. Vector sets with HNSW
-
-Modeled on Redis 8 vector sets (`VADD`, `VSIM`, `VREM`, `VCARD`, `VDIM`). Check
-the Redis docs for the full syntax and match the basic forms:
-
-```text
-VADD key VALUES 3 0.1 0.2 0.3 item1
-VSIM key VALUES 3 0.1 0.2 0.3 COUNT 10 WITHSCORES
-```
-
-HNSW (Hierarchical Navigable Small World) is the skip-list idea applied to a
-graph. Each vector gets a random level. Upper layers have few nodes and long
-links, and layer 0 has every node. A search starts at the top, moves greedily
-toward the query, and drops down one layer at a time.
-
-Build it from scratch with numpy for the distance math. Parameters to expose:
-`M` (links per node), `ef_construction`, and `ef` (search width).
-
-Benchmark (save everything in `bench/`):
-
-- Dataset: an ann-benchmarks set such as GloVe-100 or Fashion-MNIST-784, or a
-  100k subset of one.
-- Baseline: brute-force cosine search with numpy, which gives exact answers.
-- Metrics: recall@10 against the brute-force answer, p50 and p99 query latency,
-  build time, and memory.
-- Plot recall@10 against latency for several `ef` values.
-- If Redis 8 is installed, run the same queries against its vector sets.
-
-Done when: recall@10 is at least 0.95 at a latency clearly below brute force on
-100k vectors, and the plot is in the README.
-
-#### 3c. Semantic cache for LLM answers
-
-A cache that returns a stored LLM answer when a new prompt means the same thing
-as an old one, even with different words.
-
-```text
-SCACHE.SET cache "<prompt>" "<answer>" [EX seconds]
-SCACHE.GET cache "<prompt>" [THRESHOLD 0.9]
-```
-
-- Embed the prompt with a small local model (for example a sentence-transformers
-  model) in the client or in a helper process. Keep model code out of the event
-  loop, because a 50 ms embedding call would block every client.
-- Store the embedding in a 3b vector set, and store the answer as the
-  element's value.
-- `SCACHE.GET` runs `VSIM` with `COUNT 1` and returns the answer if the
-  similarity is at least the threshold.
-
-Evaluation:
-
-- Build a test set of prompt pairs labeled same meaning or different meaning.
-  A paraphrase dataset such as Quora Question Pairs works.
-- For each threshold, measure the hit rate and the wrong-hit rate (returned an
-  answer for a different question).
-- Report the threshold you would choose and why.
-
-Done when: a threshold plot and a short write-up are in `bench/`.
-
-#### 3d. Probabilistic structures
-
-| Structure | Commands | What it answers | Check |
-| --- | --- | --- | --- |
-| Bloom filter | `BF.RESERVE`, `BF.ADD`, `BF.EXISTS` | "Have I seen this item?" with no false negatives | Measured false-positive rate is within 10% of the target rate. |
-| Count-Min Sketch | `CMS.INITBYDIM`, `CMS.INCRBY`, `CMS.QUERY` | "About how many times did I see this item?" | Error stays within the eps * total bound with probability 1 - delta. |
-| HyperLogLog | `PFADD`, `PFCOUNT`, `PFMERGE` | "About how many unique items?" | Error about 0.81% with 16,384 registers, as in Redis. |
-
-Done when: each structure has a test that measures its error on 1M items and
-compares it with the theoretical bound.
-
-#### 3e. Replication
-
-A replica keeps a copy of the master's data.
-
-1. You run `REPLICAOF host port` on the replica. The replica connects to the
-   master and sends `PSYNC ? -1`.
-2. The master runs `BGSAVE`, sends the RDB file, and buffers writes made in the
-   meantime.
-3. After the RDB, the master streams every write command to the replica.
-4. Both sides track a replication offset (bytes of the command stream).
-5. Partial resync: the master keeps a 1 MB backlog. If a replica reconnects and
-   its offset is still in the backlog, the master sends only the missing part
-   instead of a full RDB.
-
-Done when: write 100,000 keys to the master, and the replica has the same
-data. Kill the replica's connection for 1 second, and it catches up with a
-partial resync, not a full one.
-
-#### 3f. C++ RESP parser
-
-Profile first with `py-spy record -o profile.svg -- python -m mini_redis`
-under `redis-benchmark` load. If parsing is a large share of the time:
-
-- Write the parser in C++ with pybind11. Input: a `bytes`/`bytearray` buffer.
-  Output: a list of arguments and the number of bytes used, or "need more".
-- Keep the Python parser and run the same tests against both.
-- Fuzz both with random and truncated input and check they agree.
-
-Done when: `redis-benchmark` results before and after are in `bench/`,
-together with the profile that shows where the time went.
-
-## 4. Testing and measuring
-
-- Unit tests: parser edge cases (split input, pipelined input, bad input) and
-  each data structure against a simple reference version.
-- End-to-end tests: start the server as a subprocess on a free port (bind to
-  port 0 to get one), and talk to it with `redis-py` and with a raw socket
-  client for malformed input. `tests/test_aof.py` shows the pattern.
-- Crash tests: kill the server at random points, restart, and check the data
-  against what the chosen fsync policy promises.
-- Benchmarks: `redis-benchmark` for throughput, `py-spy` for profiles. Always
-  run real Redis on the same machine for comparison, and save the numbers with
-  the date, the commit, and the machine.
-
-Python will be slower than real Redis. The benchmarks exist to measure by how
-much, find where the time goes, and show the change after each optimization.
+| Incomplete request | None, wait for more bytes | Open |
+| Malformed RESP | `-ERR Protocol error: <reason>` | Closed after the reply |
+| Unknown command | `-ERR unknown command 'X'` | Open |
+| Wrong number of arguments | `-ERR wrong number of arguments for 'x' command` | Open |
+| Wrong type | `-WRONGTYPE Operation against a key holding the wrong kind of value` | Open |
+| Bad integer | `-ERR value is not an integer or out of range` | Open |
+| `BGREWRITEAOF` with AOF off | `-ERR AOF is not enabled` | Open |
+
+## 12. Testing and benchmarks
+
+Unit tests cover the parsers (split, pipelined and malformed input), argument
+parsing and command handlers. End-to-end tests start the server as a separate
+process on a free port and talk to it with `redis-py` and with raw sockets.
+
+Crash tests cut bytes off the AOF at chosen points to simulate a crash during a
+write, restart the server, and check the data. Shutdown tests send `SIGINT` and
+`SIGTERM` and check that the AOF is complete and every client is closed.
+
+`bench/run.py` runs `redis-benchmark` against Mini Redis, the earlier
+thread-per-client version of this server, and real Redis on the same machine,
+with AOF on and off, at 50 and 1,000 clients, with and without pipelining. It
+saves each report under `bench/results/` with the date, commit, CPU, kernel
+and versions. See the [README](../README.md#performance) for the current
+numbers.
+
+## 13. Limitations
+
+- Data types are strings and hashes only. There is one database, with no
+  `SELECT`.
+- Inline commands (plain-text `PING` from `telnet`) are not supported.
+- There is no client output buffer limit, `maxmemory` or eviction policy.
+- `os.fork()` limits the server to Linux and macOS.
+- CPython is slower than C. At 1,000 clients without pipelining, Mini Redis
+  reaches about 70% of real Redis throughput on `GET` and 45% on `SET`. With 16
+  commands per pipeline, per-command interpreter cost dominates and real Redis
+  is 8 to 9 times faster.
 
 ## References
 
-- [RESP protocol spec](https://redis.io/docs/latest/develop/reference/protocol-spec/)
-- [Redis persistence (AOF and RDB)](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/)
+- [RESP protocol specification](https://redis.io/docs/latest/develop/reference/protocol-spec/)
+- [Redis persistence](https://redis.io/docs/latest/operate/oss_and_stack/management/persistence/)
 - [Redis replication](https://redis.io/docs/latest/operate/oss_and_stack/management/replication/)
-- [Redis vector sets](https://redis.io/docs/latest/develop/data-types/vector-sets/)
-- [Python selectors](https://docs.python.org/3/library/selectors.html)
-- [Python os.fork](https://docs.python.org/3/library/os.html#os.fork)
-- [HNSW paper (Malkov and Yashunin, 2016)](https://arxiv.org/abs/1603.09320)
-- [ann-benchmarks](https://github.com/erikbern/ann-benchmarks)
-- Reference projects: [memkv](https://github.com/quangh33/memkv) (Go, epoll,
-  skip list, Bloom, CMS) and [EP_redis_course](https://github.com/vietnakid/EP_redis_course)
-  (Go, TCP to epoll in 4 lectures)
+- [Python `selectors`](https://docs.python.org/3/library/selectors.html)
+- [Python `os.fork`](https://docs.python.org/3/library/os.html#os.fork)
