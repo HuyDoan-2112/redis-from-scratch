@@ -48,19 +48,20 @@ The thread-per-client column is this project's first design, commit `12e9de6`.
 With AOF on (`everysec`), Mini Redis serves 24,331 SET/s and 50,633 GET/s at
 1,000 clients without pipelining. The full report, including AOF-on runs and
 every raw sample, is in
-[bench/results/2026-10-26-d225a7f.md](bench/results/2026-10-26-d225a7f.md).
+[bench/results/throughput-vs-redis-2026-10-26-d225a7f.md](bench/results/throughput-vs-redis-2026-10-26-d225a7f.md).
 
 Without pipelining, Mini Redis reaches 70% of real Redis on GET at 1,000
 clients. With 16 commands per pipeline, per-command interpreter cost dominates
 and real Redis is 8 to 9 times faster.
 
-With 50 clients and no pipelining, SET reaches 14,083/s with
-`appendfsync always`, 57,078/s with `everysec` and 60,277/s with `no`. During
+With 50 clients and no pipelining, SET reaches 14,808/s with
+`appendfsync always`, 60,350/s with `everysec` and 61,690/s with `no`. During
 `BGREWRITEAOF` with 1M keys under heavy writes, the event loop stops for
-17 ms at the fork and 110 ms at the end, when the parent writes the 76 MB
-rewrite buffer and swaps in the new file. About 26 ms of that end pause is
-closing the old AOF, which makes the kernel free its blocks. See
-[bench/results/2026-11-05-6daa0d2-aof.md](bench/results/2026-11-05-6daa0d2-aof.md).
+14 ms at the fork and 87 ms at the end, when the parent writes the 80 MB
+rewrite buffer and swaps in the new file. The old AOF is closed in a
+background thread, which took the end pause with no writes from 31 ms down to
+9 ms. See
+[bench/results/aof-fsync-and-rewrite-2026-11-09-45fe870.md](bench/results/aof-fsync-and-rewrite-2026-11-09-45fe870.md).
 
 Reproduce (Linux or WSL, needs `redis-server` and `redis-benchmark`):
 
@@ -173,7 +174,7 @@ tests/                 unit and end-to-end tests
 bench/
   run.py               benchmark against the old design and real Redis
   aof.py               fsync policy throughput and BGREWRITEAOF pauses
-  results/             saved reports with date, commit and machine
+  results/             saved reports, named <benchmark>-<date>-<commit>.md
 docs/
   architecture.md      system design
   img/                 diagrams
