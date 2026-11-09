@@ -314,5 +314,70 @@ class TestBackgroundRewrite(AOFTest):
         self.assertEqual(self.path.read_bytes(), cmd_bytes("SET", "a", "1"))
 
 
+class TestOldFileClose(AOFTest):
+    """After a rewrite, the old AOF has no name and this process holds its last
+    fd. Closing it makes the kernel free the file's blocks, which takes time
+    for a big file, so it happens off the event loop."""
+
+    def setUp(self):
+        super().setUp()
+        self.aof = self.open_aof()
+        execute(make_cmd("SET", "a", "1"), self.aof)
+        self.aof.flush()
+
+    def slow_close_of_old_file(self, seconds: float) -> None:
+        """Make os.close() of the current AOF fd take `seconds`, like freeing a big file."""
+        real_close = os.close
+        old_fd = self.aof.fd
+
+        def close(fd: int) -> None:
+            if fd == old_fd:
+                time.sleep(seconds)
+            real_close(fd)
+
+        patcher = mock.patch.object(os, "close", side_effect=close)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def finish_rewrite(self) -> float:
+        """Wait for the rewrite child, and return the longest check_rewrite() call."""
+        self.aof.start_rewrite()
+        longest = 0.0
+        while self.aof.rewrite_pid is not None:
+            started = time.perf_counter()
+            self.aof.check_rewrite()
+            longest = max(longest, time.perf_counter() - started)
+            time.sleep(0.01)
+        return longest
+
+    def deleted_files_held_open(self) -> list[str]:
+        held = []
+        for fd in os.listdir("/proc/self/fd"):
+            try:
+                target = os.readlink(f"/proc/self/fd/{fd}")
+            except OSError:
+                continue  # closed while we looked
+            if target.startswith(str(self.dir)) and target.endswith(" (deleted)"):
+                held.append(target)
+        return held
+
+    def test_finishing_a_rewrite_does_not_wait_for_the_old_file_to_close(self):
+        self.slow_close_of_old_file(0.5)
+
+        self.assertLess(self.finish_rewrite(), 0.25)
+
+        execute(make_cmd("SET", "b", "2"), self.aof)
+        self.aof.flush()
+        self.assertEqual(self.path.read_bytes(), cmd_bytes("SET", "a", "1") + cmd_bytes("SET", "b", "2"))
+
+    def test_close_waits_until_the_old_file_is_closed(self):
+        self.slow_close_of_old_file(0.3)
+        self.finish_rewrite()
+
+        self.close(self.aof)
+
+        self.assertEqual(self.deleted_files_held_open(), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

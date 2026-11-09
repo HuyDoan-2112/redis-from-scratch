@@ -89,6 +89,7 @@ class AOF:
 
         self.rewrite_pid: int | None = None  # The rewrite child's process ID, None when no rewrite runs.
         self.rewrite_buf: bytearray | None = None
+        self.close_threads: list[threading.Thread] = []  # Closing old AOF fds after a rewrite.
 
     def _sync_loop(self) -> None:
         """Background thread for everysec: fsync the file once per interval."""
@@ -108,7 +109,7 @@ class AOF:
             os.fsync(self.fd)
 
     def close(self) -> None:
-        """Stop a running rewrite child and the sync thread, then flush, fsync and close the file."""
+        """Stop a running rewrite child and the sync thread, flush, fsync and close the file, and wait for old AOFs to finish closing."""
         self._kill_rewrite()
         self.stop_event.set()
         if self.sync_thread:
@@ -117,6 +118,8 @@ class AOF:
         self.flush()
         os.fsync(self.fd)
         os.close(self.fd)
+        for thread in self.close_threads:
+            thread.join()
 
     def _write_snapshot(self, temp: Path) -> int:
         """Write the current data to temp and fsync it. Returns the open fd."""
@@ -138,7 +141,20 @@ class AOF:
 
         with self.fd_lock:
             old_fd, self.fd = self.fd, fd
-            os.close(old_fd)
+        self._close_in_background(old_fd)
+
+    def _close_in_background(self, fd: int) -> None:
+        """
+        Close the old AOF in a thread, like Redis's BIO_CLOSE_FILE job.
+
+        The old file has no name now, so this is its last fd: closing it makes
+        the kernel free all its blocks, which takes tens of ms for a big file.
+        os.close() releases the GIL, so the event loop keeps running.
+        """
+        self.close_threads = [t for t in self.close_threads if t.is_alive()]
+        thread = threading.Thread(target=os.close, args=(fd,), name="aof-close", daemon=True)
+        thread.start()
+        self.close_threads.append(thread)
 
     def rewrite(self) -> None:
         """Replace the AOF with the shortest commands that rebuild the current data."""
