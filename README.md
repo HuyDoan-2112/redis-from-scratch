@@ -4,7 +4,7 @@
 > third-party runtime dependencies. One thread serves every client from a
 > non-blocking epoll event loop, speaks RESP2 to `redis-cli`, `redis-py` and
 > `redis-benchmark`, and persists data to an append-only file with configurable
-> fsync and fork-based background rewrites.
+> fsync and to CRC-checked RDB snapshots, both written by forked children.
 
 > Built with Claude (Anthropic) as a pair-programming partner for design
 > review, debugging, testing and documentation.
@@ -24,11 +24,11 @@ progress. The full design is in [docs/architecture.md](docs/architecture.md).
 | Commands | Strings, hashes, key management and TTLs, with Redis option semantics and byte-for-byte Redis error messages. See [supported commands](#supported-commands). | Done |
 | Expiry | Lazy expiry on every lookup, plus active expiry at `hz 10` using the Redis sampling cycle (20 keys, repeat above 25% expired, 25 ms time budget). O(1) TTL key sampling. | Done |
 | AOF | Every change logged as a deterministic command (`EXPIRE` becomes `PEXPIREAT`, expiry becomes `DEL`). Written once per loop turn, before replies go out. `appendfsync always`, `everysec` or `no`. | Done |
-| Crash recovery | Replays the AOF before accepting clients. Truncates a half-written last command, so the server always restarts. | Done |
+| Crash recovery | Replays the AOF, or loads `dump.rdb` when AOF is off, before accepting clients. Truncates a half-written last AOF command, so the server always restarts. Refuses to start on a corrupt snapshot. | Done |
 | AOF rewrite | `BGREWRITEAOF` forks a child that writes the smallest command set for the current data. The parent buffers writes made during the rewrite, appends them, fsyncs, and swaps the file in atomically with `os.replace()`. | Done |
-| RDB snapshots | `BGSAVE` in a forked child to a CRC-checked binary file, swapped in atomically. | In progress |
+| RDB snapshots | `BGSAVE` forks a child that writes a CRC-checked binary file and swaps it in atomically. Save points (`--save`) with a dirty counter, a final save on shutdown, and loading at startup. One background child at a time, with Redis's replies when another is running. | Done |
 | Replication | Master-replica replication over PSYNC: RDB full sync, replication offsets, and partial resync from a 1 MB backlog, verified with network fault-injection tests. | In progress |
-| Shutdown | `SIGINT` and `SIGTERM` wake the loop through a wakeup fd. The server stops any rewrite child, flushes and fsyncs the AOF, closes every client, and exits 0. | Done |
+| Shutdown | `SIGINT` and `SIGTERM` wake the loop through a wakeup fd. With save points on, the server saves `dump.rdb` first, and keeps running if that save fails. Then it stops any child, flushes and fsyncs the AOF, closes every client, and exits 0. | Done |
 
 ## Performance
 
@@ -63,12 +63,21 @@ background thread, which took the end pause with no writes from 31 ms down to
 9 ms. See
 [bench/results/aof-fsync-and-rewrite-2026-11-09-45fe870.md](bench/results/aof-fsync-and-rewrite-2026-11-09-45fe870.md).
 
+`BGSAVE` of 1M keys takes 0.94 s and stops the event loop for about 4 ms at
+the fork. The child copies 247 MB of the server's 304 MB (81%) even with no
+writes, because CPython writes the reference count of every object the child
+reads. Real Redis copies 1 MB. `gc.freeze()` before the fork changed nothing,
+so the server does not use it. See
+[bench/results/bgsave-fork-and-cow-2026-11-09-e8edb44-dirty.md](bench/results/bgsave-fork-and-cow-2026-11-09-e8edb44-dirty.md)
+and [section 9 of the architecture doc](docs/architecture.md#copy-on-write-cost-in-cpython).
+
 Reproduce (Linux or WSL, needs `redis-server` and `redis-benchmark`):
 
 ```bash
 python3 bench/run.py            # 3 runs per case, about 10 minutes
 python3 bench/run.py --runs 1   # quick check
 python3 bench/aof.py            # fsync policies and rewrite pauses, about 4 minutes
+python3 bench/rdb.py            # BGSAVE fork pause and copy-on-write memory, about 4 minutes
 ```
 
 ## Quick start
@@ -76,8 +85,9 @@ python3 bench/aof.py            # fsync policies and rewrite pauses, about 4 min
 Requires Python 3.11 or newer on Linux or macOS. Run from the project root.
 
 ```bash
-python3 -m mini_redis                                   # port 6379, no persistence
+python3 -m mini_redis                                   # port 6379, BGSAVE only on request
 python3 -m mini_redis --aof                             # AOF on, fsync every second
+python3 -m mini_redis --save "60 1000 300 10"           # snapshot after 60 s if 1,000+ writes, or 300 s if 10+
 python3 -m mini_redis --port 6380 --aof --appendfsync always --aof-path data/appendonly.aof
 ```
 
@@ -96,10 +106,20 @@ $ redis-cli HGET user:1 city
 "Hanoi"
 $ redis-cli BGREWRITEAOF
 Background append only file rewriting started
+$ redis-cli BGSAVE
+Background saving started
+$ redis-cli LASTSAVE
+(integer) 1794225600
 ```
 
 With `--aof`, stop the server with Ctrl+C and start it again. The data is
-still there, and `session:42` keeps its remaining TTL.
+still there, and `session:42` keeps its remaining TTL. Without `--aof`, the
+server loads `dump.rdb` from the last `BGSAVE`, or from the final save at
+shutdown when `--save` is set.
+
+To check everything by hand, [docs/try-every-command.md](docs/try-every-command.md)
+walks through every command, the error replies, snapshots, save points, the AOF
+and restarts, with the output to expect at each step.
 
 ## Configuration
 
@@ -110,6 +130,8 @@ still there, and `session:42` keeps its remaining TTL.
 | `--aof` | off | Turn on the append-only file |
 | `--aof-path` | `appendonly.aof` | AOF location. The rewrite temp file goes in the same directory |
 | `--appendfsync` | `everysec` | `always`, `everysec` or `no`. See [fsync policies](docs/architecture.md#fsync-policies) |
+| `--rdb-path` | `dump.rdb` | Snapshot location. The `BGSAVE` temp file goes in the same directory |
+| `--save` | off | Save points as `"SECONDS CHANGES ..."` pairs: save after SECONDS if at least CHANGES writes happened, and save once more on shutdown. See [save points](docs/architecture.md#save-points) |
 
 Fixed settings in [`mini_redis/config.py`](mini_redis/config.py) match the
 Redis defaults: `tcp-backlog 511`, 16 KB reads per `recv()`, and `hz 10`.
@@ -122,7 +144,7 @@ Redis defaults: `tcp-backlog 511`, 16 KB reads per `recv()`, and `hz 10`.
 | Strings | `SET key value [NX \| XX] [GET] [EX s \| PX ms \| EXAT ts \| PXAT ts \| KEEPTTL]`, `GET key`, `INCR key` |
 | Hashes | `HSET key field value`, `HGET key field` |
 | Keys | `DEL key [key ...]`, `EXISTS key [key ...]`, `EXPIRE key seconds [NX \| XX \| GT \| LT]`, `PEXPIREAT key ms [NX \| XX \| GT \| LT]`, `TTL key`, `DBSIZE` |
-| Persistence | `BGREWRITEAOF` |
+| Persistence | `BGREWRITEAOF`, `BGSAVE`, `LASTSAVE` |
 
 Replies and errors match Redis, including `WRONGTYPE` for a key of the wrong
 type and `ERR value is not an integer or out of range` for bad integers.
@@ -140,7 +162,12 @@ python3 -m unittest discover -s tests -v
 | `test_args.py` | Strict 64-bit integer parsing and option parsing |
 | `test_commands.py` | Command table, arity, and that only write commands reach the AOF |
 | `test_server.py` | Real server process: shutdown on `SIGINT` and `SIGTERM`, protocol errors close the connection |
-| `test_aof.py` | Crash recovery: cuts bytes off the AOF at chosen points, restarts the server, and checks the data |
+| `test_aof.py` | AOF class: crash recovery, buffering, fsync policies, background rewrite, and `BGREWRITEAOF` replies when another child runs |
+| `test_aof_logging.py` | What each write command logs to the AOF |
+| `test_aof_server.py` | Real server with AOF: restarts, `SIGKILL` under each fsync policy, `BGREWRITEAOF` and `SIGTERM` during a rewrite |
+| `test_child.py` | The background child slot: reaping, failure exit codes, kill at shutdown, one child at a time |
+| `test_rdb.py` | RDB format byte for byte, every truncation and bit flip, `BGSAVE`, `LASTSAVE`, loading, save points and the dirty counter |
+| `test_rdb_server.py` | Real server with RDB: `BGSAVE`, restarts, corrupt snapshots, turning AOF on, save points, and a failing final save |
 | `test_redis_py.py` | `redis-py` against a running server: pipelines, binary values, large values, many arguments, several clients |
 | `test_main.py` | Command-line options and config validation |
 
@@ -152,7 +179,7 @@ same way a user runs it.
 ```text
 mini_redis/
   __main__.py          command-line options
-  config.py            frozen, validated server and AOF settings
+  config.py            frozen, validated server, AOF and RDB settings
   server.py            event loop, cron, before_sleep, shutdown
   client.py            per-client socket, parser and output buffer
   resp.py              RESP2 encoder, incremental parser, AOF reader
@@ -164,19 +191,24 @@ mini_redis/
     strings.py         SET, GET, INCR
     hashes.py          HSET, HGET
     keys.py            DEL, EXISTS, EXPIRE, PEXPIREAT, TTL, DBSIZE
-    persistence.py     BGREWRITEAOF
+    persistence.py     BGREWRITEAOF, BGSAVE, LASTSAVE
   storage/
     keyspace.py        data, TTLs, lazy expiry, O(1) TTL sampling
     expire.py          active expiry cycle
   persistence/
     aof.py             AOF buffer, fsync policies, replay, recovery, rewrite
+    rdb.py             RDB format, BGSAVE, loading at startup, save points
+    child.py           the one background child: fork, reap, kill
+    files.py           directory fsync
 tests/                 unit and end-to-end tests
 bench/
   run.py               benchmark against the old design and real Redis
   aof.py               fsync policy throughput and BGREWRITEAOF pauses
+  rdb.py               BGSAVE fork pause and copy-on-write memory
   results/             saved reports, named <benchmark>-<date>-<commit>.md
 docs/
   architecture.md      system design
+  try-every-command.md hands-on tour of every command with redis-cli
   img/                 diagrams
 ```
 

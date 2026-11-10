@@ -12,7 +12,7 @@ import time
 import unittest
 from pathlib import Path
 
-from tests.helpers import cmd_bytes, free_port
+from tests.helpers import Server, cmd_bytes, free_port
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -69,6 +69,19 @@ class TestShutdown(unittest.TestCase):
                 self.assertEqual(client.recv(100), b"", "server did not close the client")
                 self.assertEqual(proc.wait(timeout=5), 0)
                 self.assertEqual(aof_path.read_bytes(), cmd_bytes("SET", "a", "1"))
+
+    def test_stop_signal_is_logged_once(self):
+        for name, sig in STOP_SIGNALS.items():
+            with self.subTest(signal=name), tempfile.TemporaryDirectory() as tmp:
+                server = Server(free_port(), Path(tmp) / "server.log", "--rdb-path", str(Path(tmp) / "dump.rdb"))
+                self.addCleanup(server.kill)
+                server.start()
+
+                server.proc.send_signal(sig)
+
+                self.assertEqual(server.proc.wait(timeout=5), 0)
+                server.proc = None
+                self.assertEqual(server.log().count(f"Received {name}, shutting down"), 1, server.log())
 
 
 class TestProtocolErrors(unittest.TestCase):

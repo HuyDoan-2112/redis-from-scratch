@@ -59,3 +59,13 @@ def sample_ttl_keys(n: int) -> list[bytes]:
     if len(ttl_keys) <= n:
         return ttl_keys.copy()
     return [ttl_keys[i] for i in random.sample(range(len(ttl_keys)), n)]
+
+def replace_all(new_store: dict, new_expires: dict) -> None:
+    """Replace all data, e.g. with a loaded snapshot. Not logged to the AOF."""
+    store.clear()
+    store.update(new_store)
+    expires.clear()
+    ttl_keys.clear()
+    ttl_pos.clear()
+    for key, deadline in new_expires.items():
+        set_ttl(key, deadline)

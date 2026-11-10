@@ -1,5 +1,5 @@
-"""Tests for the AOF class: crash recovery, buffering, fsync policies and
-the background rewrite.
+"""Tests for the AOF class: crash recovery, buffering, fsync policies, the
+background rewrite and the BGREWRITEAOF command.
 
 Run from the project root:
     python3 -m unittest tests.test_aof -v
@@ -14,10 +14,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from mini_redis.persistence import aof as aof_module, child
 from mini_redis.persistence.aof import AOF
 from mini_redis.config import AOFConfig, FSYNC_POLICIES
-from mini_redis.server import execute
-from tests.helpers import cmd_bytes, make_cmd, replay, reset_keyspace
+from mini_redis.resp import RESPType, Value
+from mini_redis.server import cron, execute
+from tests.helpers import capture_fd2, cmd_bytes, make_cmd, replay, reset_keyspace, wait_for_child
 
 FAR_FUTURE_MS = 4102444800000  # 2100-01-01, a deadline that never passes during a test
 
@@ -108,16 +110,6 @@ class TestAOFRecovery(unittest.TestCase):
         self.assertEqual(commands, [["SET", "a", "1"], ["SET", "c", "3"]])
 
 
-def wait_for_rewrite(aof: AOF, timeout: float = 5.0) -> None:
-    """Run check_rewrite() the way the server's cron does, until the child is done."""
-    deadline = time.time() + timeout
-    while aof.rewrite_pid is not None:
-        if time.time() > deadline:
-            raise AssertionError("rewrite child did not finish")
-        aof.check_rewrite()
-        time.sleep(0.01)
-
-
 class AOFTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -127,6 +119,9 @@ class AOFTest(unittest.TestCase):
         self.closed: list[AOF] = []
         reset_keyspace()
         self.addCleanup(reset_keyspace)
+        # The child slot is module state. Free it even if a test fails mid-rewrite,
+        # or every later test fails with "child is already running".
+        self.addCleanup(child.kill)
 
     def open_aof(self, appendfsync: str = "no") -> AOF:
         aof = AOF(AOFConfig(path=self.path, enabled=True, appendfsync=appendfsync))
@@ -233,7 +228,7 @@ class TestBackgroundRewrite(AOFTest):
         self.aof.flush()
 
         self.aof.start_rewrite()
-        wait_for_rewrite(self.aof)
+        wait_for_child()
 
         self.assertEqual(
             self.path.read_bytes(),
@@ -252,7 +247,7 @@ class TestBackgroundRewrite(AOFTest):
         self.aof.start_rewrite()
         self.do("SET b 2", "DEL a")  # the child does not see these
         self.aof.flush()
-        wait_for_rewrite(self.aof)
+        wait_for_child()
 
         self.do("SET c 3")  # goes to the new file
         self.close(self.aof)
@@ -269,16 +264,9 @@ class TestBackgroundRewrite(AOFTest):
         time.sleep(0.05)  # short has expired, but nothing has deleted it yet
 
         self.aof.start_rewrite()
-        wait_for_rewrite(self.aof)
+        wait_for_child()
 
         self.assertEqual(self.path.read_bytes(), cmd_bytes("SET", "keep", "v"))
-
-    def test_second_rewrite_while_one_runs_is_refused(self):
-        self.aof.start_rewrite()
-
-        with self.assertRaisesRegex(RuntimeError, "already in progress"):
-            self.aof.start_rewrite()
-        wait_for_rewrite(self.aof)
 
     def test_failed_rewrite_keeps_the_old_file(self):
         self.do("SET a 1")
@@ -287,9 +275,13 @@ class TestBackgroundRewrite(AOFTest):
         blocker = self.dir / "temp-rewrite.aof"
         blocker.mkdir()
 
-        self.aof.start_rewrite()
-        with contextlib.redirect_stdout(io.StringIO()):
-            wait_for_rewrite(self.aof)
+        # Start inside capture_fd2: the child keeps the stderr it had at the fork.
+        with capture_fd2() as stderr, contextlib.redirect_stdout(io.StringIO()) as out:
+            self.aof.start_rewrite()
+            wait_for_child()
+        self.assertIn(b"IsADirectoryError", bytes(stderr))  # the child's traceback
+        # A second line follows: unlink() of the blocker fails because it is a directory.
+        self.assertTrue(out.getvalue().startswith("Background aof child failed (exit code 1)\n"), out.getvalue())
 
         self.do("SET b 2")
         self.aof.flush()
@@ -298,20 +290,106 @@ class TestBackgroundRewrite(AOFTest):
         # Once the problem is gone, a new rewrite works.
         blocker.rmdir()
         self.aof.start_rewrite()
-        wait_for_rewrite(self.aof)
+        wait_for_child()
         self.assertEqual(self.path.read_bytes(), cmd_bytes("SET", "a", "1") + cmd_bytes("SET", "b", "2"))
 
     def test_close_during_rewrite_stops_the_child(self):
         self.do("SET a 1")
         self.aof.start_rewrite()
-        pid = self.aof.rewrite_pid
+        pid = child._pid
 
-        self.close(self.aof)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.close(self.aof)
+
+        self.assertEqual(out.getvalue(), "", "stopping a rewrite at shutdown is not a failure")
+        self.assertIsNone(child.kind)
 
         with self.assertRaises(ChildProcessError):
             os.waitpid(pid, os.WNOHANG)  # already reaped: no zombie left
         self.assertEqual(list(self.dir.glob("temp-*")), [])
         self.assertEqual(self.path.read_bytes(), cmd_bytes("SET", "a", "1"))
+
+
+class TestBGRewriteAOFCommand(AOFTest):
+    """Only one child (AOF rewrite or RDB save) runs at a time. BGREWRITEAOF
+    replies like Redis when a child is already running, and cron starts a
+    scheduled rewrite once the other child is done."""
+
+    def setUp(self):
+        super().setUp()
+        self.aof = self.open_aof()
+        aof_module.current = self.aof
+        self.addCleanup(setattr, aof_module, "current", None)
+        execute(make_cmd("SET", "a", "1"), self.aof)
+        execute(make_cmd("INCR", "n"), self.aof)
+        execute(make_cmd("INCR", "n"), self.aof)
+        self.aof.flush()
+
+    def bgrewriteaof(self) -> Value:
+        return execute(make_cmd("BGREWRITEAOF"), self.aof)
+
+    def start_rdb_child(self, seconds: float) -> list[bool]:
+        """Stand-in for BGSAVE: a child that sleeps. Returns the list its on_done appends to."""
+        done: list[bool] = []
+        child.start("rdb", lambda: time.sleep(seconds), done.append)
+        return done
+
+    def test_starts_a_rewrite_when_no_child_runs(self):
+        reply = self.bgrewriteaof()
+
+        self.assertEqual((reply.typ, reply.string),
+                         (RESPType.SIMPLE_STRING, "Background append only file rewriting started"))
+        self.assertEqual(child.kind, "aof")
+        wait_for_child()
+        self.assertEqual(self.path.read_bytes(), cmd_bytes("SET", "a", "1") + cmd_bytes("SET", "n", "2"))
+
+    def test_second_rewrite_while_one_runs_is_refused(self):
+        self.bgrewriteaof()
+
+        reply = self.bgrewriteaof()
+
+        self.assertEqual((reply.typ, reply.string),
+                         (RESPType.ERROR, "ERR Background append only file rewriting already in progress"))
+        wait_for_child()
+
+    def test_rewrite_is_scheduled_while_another_child_runs(self):
+        done = self.start_rdb_child(0.3)
+
+        for _ in range(2):  # asking again while scheduled is still "scheduled", as in Redis
+            reply = self.bgrewriteaof()
+            self.assertEqual((reply.typ, reply.string),
+                             (RESPType.SIMPLE_STRING, "Background append only file rewriting scheduled"))
+        self.assertEqual(child.kind, "rdb")
+        self.assertTrue(self.aof.rewrite_scheduled)
+
+        # cron reaps the other child, then starts the rewrite in the same tick.
+        deadline = time.time() + 5
+        while child.kind != "aof":
+            self.assertLess(time.time(), deadline, "scheduled rewrite never started")
+            cron(self.aof, hz=10)
+            time.sleep(0.01)
+        self.assertEqual(done, [True])
+        self.assertFalse(self.aof.rewrite_scheduled)
+
+        wait_for_child()
+        self.assertEqual(self.path.read_bytes(), cmd_bytes("SET", "a", "1") + cmd_bytes("SET", "n", "2"))
+
+    def test_scheduled_rewrite_that_cannot_fork_is_retried_next_tick(self):
+        self.aof.rewrite_scheduled = True
+
+        failing_fork = mock.patch.object(os, "fork", side_effect=OSError(12, "Cannot allocate memory"))
+        with failing_fork, contextlib.redirect_stdout(io.StringIO()) as out:
+            cron(self.aof, hz=10)
+
+        self.assertIn("Cannot allocate memory", out.getvalue())
+        self.assertIsNone(child.kind)
+        self.assertTrue(self.aof.rewrite_scheduled)
+        self.assertIsNone(self.aof.rewrite_buf, "nothing may collect writes for a rewrite that never started")
+
+        cron(self.aof, hz=10)
+        self.assertEqual(child.kind, "aof")
+        wait_for_child()
+        self.assertEqual(self.path.read_bytes(), cmd_bytes("SET", "a", "1") + cmd_bytes("SET", "n", "2"))
 
 
 class TestOldFileClose(AOFTest):
@@ -340,12 +418,12 @@ class TestOldFileClose(AOFTest):
         self.addCleanup(patcher.stop)
 
     def finish_rewrite(self) -> float:
-        """Wait for the rewrite child, and return the longest check_rewrite() call."""
+        """Wait for the rewrite child, and return the longest child.check() call."""
         self.aof.start_rewrite()
         longest = 0.0
-        while self.aof.rewrite_pid is not None:
+        while child.kind is not None:
             started = time.perf_counter()
-            self.aof.check_rewrite()
+            child.check()
             longest = max(longest, time.perf_counter() - started)
             time.sleep(0.01)
         return longest

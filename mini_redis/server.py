@@ -7,6 +7,7 @@ import signal
 import time
 
 from mini_redis.config import DEFAULT_CONFIG, ServerConfig
+from mini_redis.persistence.rdb import RDB
 from mini_redis.resp import ProtocolError, Value, RESPType
 from mini_redis.commands.registry import CommandError, lookup_command
 from mini_redis.persistence.aof import AOF
@@ -14,23 +15,33 @@ from mini_redis.client import Client
 from mini_redis.propagation import take
 from mini_redis.storage.expire import active_expire_cycle
 from mini_redis.storage.keyspace import now_ms
-from mini_redis.persistence import aof as aof_module
-
+from mini_redis.persistence import aof as aof_module, child, rdb as rdb_module
+ 
 # Signals that stop the server cleanly.
 SHUTDOWN_SIGNALS = [signal.SIGINT, signal.SIGTERM]
 
 def run(config: ServerConfig = DEFAULT_CONFIG) -> None:
     """Load the AOF, then serve clients until SIGINT or SIGTERM arrives."""
+    aof_is_new =config.aof.enabled and not config.aof.path.exists()
+
+    rdb = RDB(config.rdb)
+    loaded = None
+    if not config.aof.enabled or aof_is_new:
+        loaded = rdb.load_file()
+
     aof = AOF(config.aof) if config.aof.enabled else None
     if aof is not None:
-        # Rebuild the data before accepting clients, so nobody sees a
-        # half-loaded store.
         try:
-            aof.read(replay_command)
+            if not aof_is_new:
+                aof.read(replay_command)      # an existing AOF wins over dump.rdb
+            elif loaded is not None:
+                aof.rewrite()                 # first start with AOF on: the AOF starts from the snapshot
         except Exception:
             aof.close()
             raise
+        
     aof_module.current = aof
+    rdb_module.current = rdb
 
     sel = selectors.DefaultSelector()
     lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM) # AF_INET = IPv4, SOCK_STREAM = TCP
@@ -63,7 +74,13 @@ def run(config: ServerConfig = DEFAULT_CONFIG) -> None:
     next_cron = time.monotonic()
     try:
         pending_writes: set[Client] = set()
-        while not received:
+        while True:
+            if received:
+                print(f"Received {signal.Signals(received[0]).name}, shutting down")
+                if prepare_for_shutdown(rdb):
+                    break
+                received.clear()       # keep serving; the next signal tries again
+                
             timeout = max(0.0, next_cron - time.monotonic())
             # Block until at least one socket is ready. `mask` says whether it
             # is ready to read, to write, or both.
@@ -79,7 +96,6 @@ def run(config: ServerConfig = DEFAULT_CONFIG) -> None:
                 cron(aof, config.hz)
                 next_cron = now + 1.0 / config.hz
             before_sleep(sel, aof, pending_writes)
-        print(f"Received {signal.Signals(received[0]).name}, shutting down")
     finally:
         # Put the old signal setup back, so tests that call run() in a
         # thread or several times do not leak handlers.
@@ -112,6 +128,7 @@ def drain(sock: socket.socket) -> None:
 
 def shutdown(sel: selectors.BaseSelector, aof: AOF | None) -> None:
     """Save the AOF, then close all sockets."""
+    child.kill()
     if aof is not None:
         aof.close()  # flush and fsync
     for key in list(sel.get_map().values()):
@@ -274,18 +291,49 @@ def set_events(sel: selectors.BaseSelector, client: Client, events: int) -> None
 def write_changes(aof: AOF | None) -> None:
     """Write all changes that have been recorded since the last call."""
     changes = take()
+    if rdb_module.current is not None:
+        rdb_module.current.dirty += len(changes)
+
     if aof is not None:
         for change in changes:
             aof.write(change)
 
 def cron(aof: AOF | None, hz: int) -> None:
     """Run periodic tasks, once per tick."""
-    if aof is not None:
-        aof.check_rewrite()
+    child.check()
+    if aof is not None and aof.rewrite_scheduled and child.kind is None:
+        try:
+            aof.start_rewrite()
+        except OSError as err:
+            aof.rewrite_scheduled = True
+            print(f"Scheduled AOF rewrite failed to start: {err}")
+
+    rdb = rdb_module.current
+    if rdb is not None and child.kind is None:
+        point = rdb.save_point_due(time.time())
+        if point is not None:
+            print(f"{point[1]} changes in {point[0]} seconds. Saving...")
+            try:
+                rdb.start_save()
+            except OSError as err:
+                print(f"Background saving failed to start: {err}")
 
     time_limit = 0.25/hz
     active_expire_cycle(now_ms(), time_limit)
     write_changes(aof)
+
+def prepare_for_shutdown(rdb: RDB) -> bool:
+    """Save one last time if save points are on. False if the save failed:
+    the server then keeps running, like Redis, so no data is lost."""
+    if not rdb.config.save_points:
+        return True
+    child.kill()
+    try:
+        rdb.save()
+    except OSError as err:
+        print(f"Error trying to save the DB, can't exit: {err}")
+        return False
+    return True
 
 if __name__ == "__main__":
     run()

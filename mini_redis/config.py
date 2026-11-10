@@ -6,6 +6,17 @@ from pathlib import Path
 FSYNC_POLICIES = ("always", "everysec", "no")
 
 @dataclass(frozen=True)
+class RDBConfig:
+    """Configuration for RDB snapshots."""
+
+    path: Path = Path("dump.rdb")
+    save_points: tuple[tuple[int, int], ...] = ()
+
+    def __post_init__(self) -> None:
+         if any(seconds < 1 or changes < 1 for seconds, changes in self.save_points):
+            raise ValueError("save point seconds and changes must be at least 1")
+
+@dataclass(frozen=True)
 class AOFConfig:
     """Configuration for the AOF feature of REDIS."""
 
@@ -32,6 +43,7 @@ class ServerConfig:
     recv_buffer_size: int = 16 * 1024  # Max bytes read per recv() call, same as Redis PROTO_IOBUF_LEN
     hz: int = 10  # How often to run the server's periodic tasks, in times per second
     aof: AOFConfig = field(default_factory=AOFConfig)
+    rdb: RDBConfig = field(default_factory=RDBConfig)
 
     def __post_init__(self) -> None:
         if not 0 < self.port <= 65535:

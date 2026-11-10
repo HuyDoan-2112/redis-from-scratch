@@ -4,12 +4,13 @@
 """
 import os
 import threading
-import signal
 
 from pathlib import Path
 from typing import Callable
 
 from mini_redis.config import AOFConfig
+from mini_redis.persistence import child
+from mini_redis.persistence.files import fsync_dir
 from mini_redis.resp import RESPType, Value, RESPReader
 from mini_redis.storage import keyspace
 
@@ -42,14 +43,6 @@ def keyspace_to_commands() -> bytes:
             out += _command(b"PEXPIREAT", key, str(deadline).encode())
 
     return bytes(out)
-
-def _fsync_dir(path: Path) -> None:
-    """fsync a directory, so a rename inside it survives power loss."""
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 def _write_all( fd: int, data: bytearray) -> None:
     """Write all of data to the file. os.write() may write only part of it."""
@@ -87,10 +80,11 @@ class AOF:
             )
             self.sync_thread.start()
 
-        self.rewrite_pid: int | None = None  # The rewrite child's process ID, None when no rewrite runs.
         self.rewrite_buf: bytearray | None = None
         self.close_threads: list[threading.Thread] = []  # Closing old AOF fds after a rewrite.
-
+           
+        self.rewrite_scheduled = False   # BGREWRITEAOF came in while another child was running
+    
     def _sync_loop(self) -> None:
         """Background thread for everysec: fsync the file once per interval."""
         # wait() returns False on timeout (time to sync) and True once
@@ -110,7 +104,9 @@ class AOF:
 
     def close(self) -> None:
         """Stop a running rewrite child and the sync thread, flush, fsync and close the file, and wait for old AOFs to finish closing."""
-        self._kill_rewrite()
+        if child.kind == "aof":
+            child.kill()
+
         self.stop_event.set()
         if self.sync_thread:
             self.sync_thread.join()
@@ -137,7 +133,7 @@ class AOF:
         """Make temp the AOF and switch self.fd to it."""
         path = Path(self.config.path)
         os.replace(temp, path)
-        _fsync_dir(path.parent)
+        fsync_dir(path.parent)
 
         with self.fd_lock:
             old_fd, self.fd = self.fd, fd
@@ -176,38 +172,23 @@ class AOF:
 
     def start_rewrite(self) -> None:
         """Start a rewrite in a child process. Returns right away."""
-        if self.rewrite_pid is not None:
-            raise RuntimeError("Background append only file rewriting already in progress")
-        pid = os.fork()
-        if pid == 0:
-            # Child. It must never return into the server code.
-            try:
-                fd = self._write_snapshot(self._temp_path())
-                os.close(fd)
-                os._exit(0)
-            except BaseException:
-                os._exit(1)
-        self.rewrite_pid = pid
+        self.rewrite_scheduled = False
+        child.start("aof", self._rewrite_in_child, self._rewrite_done)
         self.rewrite_buf = bytearray()
 
-    def check_rewrite(self) -> None:
-        """If the rewrite child has exited, finish or discard its work."""
-        if self.rewrite_pid is None:
-            return
-        pid, status = os.waitpid(self.rewrite_pid, os.WNOHANG)
-        if pid == 0:
-            return
+    def _rewrite_in_child(self) -> None:
+        os.close(self._write_snapshot(self._temp_path()))
+
+    def _rewrite_done(self, ok: bool) -> None:
 
         try:
-            if os.waitstatus_to_exitcode(status) == 0:
+            if ok:
                 self._finish_rewrite()
             else:
                 self._temp_path().unlink(missing_ok=True)
-                print("AOF rewrite child failed")
         except OSError as err:
             print(f"AOF rewrite failed: {err}")
         finally:
-            self.rewrite_pid = None
             self.rewrite_buf = None
 
     def _finish_rewrite(self) -> None:
@@ -258,16 +239,6 @@ class AOF:
     def _temp_path(self) -> Path:
         """Temp file next to the AOF, so os.replace is atomic."""
         return Path(self.config.path).with_name("temp-rewrite.aof")
-
-    def _kill_rewrite(self) -> None:
-        """Stop a running rewrite child and delete its unfinished file."""
-        if self.rewrite_pid is None:
-            return
-        os.kill(self.rewrite_pid, signal.SIGKILL)
-        os.waitpid(self.rewrite_pid, 0)
-        self._temp_path().unlink(missing_ok=True)
-        self.rewrite_pid = None
-        self.rewrite_buf = None
 
 
 # The server's AOF, set by server.run(). Command handlers only get args,
