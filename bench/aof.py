@@ -6,7 +6,7 @@ Run from the project root:
     python bench/aof.py            # 3 runs per case, about 4 minutes
     python bench/aof.py --runs 1   # quick check
 
-Writes the report to bench/results/<date>-<commit>-aof.md.
+Writes the report to bench/results/aof-fsync-and-rewrite-<date>-<commit>.md.
 
 Part 1 runs `redis-benchmark -t set` against mini_redis and real Redis with
 each appendfsync policy.
@@ -288,7 +288,7 @@ def main() -> None:
         pauses = rewrite_pauses(runs, tmp)
 
     text = report(rps, pauses, runs, commit)
-    out = ROOT / "bench" / "results" / f"{datetime.date.today()}-{commit}-aof.md"
+    out = ROOT / "bench" / "results" / f"aof-fsync-and-rewrite-{datetime.date.today()}-{commit}.md"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(text)
     print(text)

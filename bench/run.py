@@ -6,7 +6,7 @@ Run from the project root:
     python bench/run.py            # 3 runs per case, about 10 minutes
     python bench/run.py --runs 1   # quick check
 
-Writes the report to bench/results/<date>-<commit>.md.
+Writes the report to bench/results/throughput-vs-redis-<date>-<commit>.md.
 """
 
 import argparse
@@ -198,7 +198,7 @@ def main() -> None:
                     stop_server(proc)
 
     text = report(results, runs, commit)
-    out = ROOT / "bench" / "results" / f"{datetime.date.today()}-{commit}.md"
+    out = ROOT / "bench" / "results" / f"throughput-vs-redis-{datetime.date.today()}-{commit}.md"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(text)
     print(text)

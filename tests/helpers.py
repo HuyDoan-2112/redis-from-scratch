@@ -1,11 +1,14 @@
 import contextlib
 import io
+import os
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
+from mini_redis.persistence import child
 from mini_redis.persistence.aof import AOF
 from mini_redis.config import AOFConfig
 from mini_redis.resp import Value, RESPType
@@ -53,6 +56,68 @@ def reset_keyspace() -> None:
     keyspace.expires.clear()
     keyspace.ttl_keys.clear()
     keyspace.ttl_pos.clear()
+
+
+def wait_for_child(timeout: float = 5.0) -> None:
+    """Run child.check() the way the server's cron does, until no child runs."""
+    deadline = time.time() + timeout
+    while child.kind is not None:
+        if time.time() > deadline:
+            raise AssertionError(f"{child.kind} child did not finish")
+        child.check()
+        time.sleep(0.01)
+
+
+@contextlib.contextmanager
+def capture_fd2():
+    """Send fd 2 (stderr) to a temp file, so output from a forked child is captured too."""
+    with tempfile.TemporaryFile() as out:
+        sys.stderr.flush()
+        saved = os.dup(2)
+        os.dup2(out.fileno(), 2)
+        captured = bytearray()
+        try:
+            yield captured
+        finally:
+            sys.stderr.flush()
+            os.dup2(saved, 2)
+            os.close(saved)
+            out.seek(0)
+            captured += out.read()
+
+
+def wait_until(condition, timeout: float = 5.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if condition():
+            return True
+        time.sleep(0.02)
+    return condition()
+
+
+def child_pids(pid: int) -> list[int]:
+    """Process IDs whose parent is pid (Linux /proc)."""
+    children = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            stat = Path(f"/proc/{entry}/stat").read_text()
+        except OSError:
+            continue  # the process exited while we looked
+        # Field 4 is the parent PID. Field 2 (the name) may contain spaces,
+        # so split after its closing parenthesis.
+        if int(stat.rpartition(")")[2].split()[1]) == pid:
+            children.append(int(entry))
+    return children
+
+
+def pid_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 def free_port() -> int:

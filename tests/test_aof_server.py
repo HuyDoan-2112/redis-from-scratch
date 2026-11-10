@@ -15,43 +15,9 @@ import unittest
 from pathlib import Path
 
 from mini_redis.config import FSYNC_POLICIES
-from tests.helpers import Server, cmd_bytes, free_port, replay
+from tests.helpers import Server, child_pids, cmd_bytes, free_port, pid_exists, replay, wait_until
 
 FAR_FUTURE_MS = 4102444800000  # 2100-01-01, a deadline that never passes during a test
-
-
-def wait_until(condition, timeout: float = 5.0) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if condition():
-            return True
-        time.sleep(0.02)
-    return condition()
-
-
-def child_pids(pid: int) -> list[int]:
-    """Process IDs whose parent is pid (Linux /proc)."""
-    children = []
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit():
-            continue
-        try:
-            stat = Path(f"/proc/{entry}/stat").read_text()
-        except OSError:
-            continue  # the process exited while we looked
-        # Field 4 is the parent PID. Field 2 (the name) may contain spaces,
-        # so split after its closing parenthesis.
-        if int(stat.rpartition(")")[2].split()[1]) == pid:
-            children.append(int(entry))
-    return children
-
-
-def pid_exists(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    return True
 
 
 class AOFServerTest(unittest.TestCase):
@@ -250,6 +216,22 @@ class TestBGRewriteAOF(AOFServerTest):
         c = self.client(server)
         with self.assertRaisesRegex(RuntimeError, "^ERR AOF is not enabled$"):
             c.call("BGREWRITEAOF")
+
+    def test_second_rewrite_while_one_runs_is_an_error(self):
+        server = self.server()
+        server.start()
+        c = self.client(server)
+        c.call("SET", "a", "1")
+
+        # One send: the server runs both in the same loop turn, before cron can
+        # reap the first child, so the second always sees it running.
+        c.sock.sendall(cmd_bytes("BGREWRITEAOF") * 2)
+
+        self.assertEqual(c._read_reply(), "Background append only file rewriting started")
+        with self.assertRaisesRegex(RuntimeError, "^ERR Background append only file rewriting already in progress$"):
+            c._read_reply()
+        self.assertTrue(wait_until(lambda: self.aof_path.read_bytes() == cmd_bytes("SET", "a", "1")))
+        self.assertTrue(wait_until(lambda: child_pids(server.proc.pid) == []), "rewrite child was not reaped")
 
     def test_sigterm_during_rewrite(self):
         """Stopping mid-rewrite exits cleanly, leaves no child or temp file,

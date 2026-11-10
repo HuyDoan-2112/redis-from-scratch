@@ -1,7 +1,7 @@
 from typing import Callable, List
 from dataclasses import dataclass
 
-from mini_redis.commands.persistence import bgrewriteaof_cmd
+from mini_redis.commands.persistence import bgrewriteaof_cmd, bgsave_cmd, lastsave_cmd
 from mini_redis.resp import RESPType, Value
 from mini_redis.commands.connection import ping, echo
 from mini_redis.commands.strings import set_cmd, get, incr_cmd
@@ -12,7 +12,7 @@ from mini_redis.commands.keys import (
     exists_cmd,
     expire_cmd,
     pexpireat_cmd,
-    ttl_cmd
+    ttl_cmd,
 )
 from mini_redis.commands.errors import CommandError
 
@@ -62,6 +62,8 @@ cmds = [
     Command("TTL", ttl_cmd, 2),
     Command("INCR", incr_cmd, 2, write=True),
     Command("DBSIZE", dbsize_cmd, 1),
-    Command("BGREWRITEAOF", bgrewriteaof_cmd, 1)
+    Command("BGREWRITEAOF", bgrewriteaof_cmd, 1),
+    Command("BGSAVE", bgsave_cmd, 1),
+    Command("LASTSAVE", lastsave_cmd, 1),
 ]
 COMMANDS: dict[str, Command] = {c.name: c for c in cmds}
