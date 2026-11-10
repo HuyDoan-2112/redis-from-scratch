@@ -63,12 +63,12 @@ background thread, which took the end pause with no writes from 31 ms down to
 9 ms. See
 [bench/results/aof-fsync-and-rewrite-2026-11-09-45fe870.md](bench/results/aof-fsync-and-rewrite-2026-11-09-45fe870.md).
 
-`BGSAVE` of 1M keys takes 0.94 s and stops the event loop for about 4 ms at
-the fork. The child copies 247 MB of the server's 304 MB (81%) even with no
+`BGSAVE` of 1M keys takes about 1.1 s and stops the event loop for about 6 ms
+at the fork. The child copies 247 MB of the server's 304 MB (81%) even with no
 writes, because CPython writes the reference count of every object the child
-reads. Real Redis copies 1 MB. `gc.freeze()` before the fork changed nothing,
-so the server does not use it. See
-[bench/results/bgsave-fork-and-cow-2026-11-09-e8edb44-dirty.md](bench/results/bgsave-fork-and-cow-2026-11-09-e8edb44-dirty.md)
+reads. Real Redis copies 1 MB. `gc.freeze()` before the fork did not reduce
+the copying, so the server does not use it. See
+[bench/results/bgsave-fork-and-cow-2026-11-09-2dde6e9.md](bench/results/bgsave-fork-and-cow-2026-11-09-2dde6e9.md)
 and [section 9 of the architecture doc](docs/architecture.md#copy-on-write-cost-in-cpython).
 
 Reproduce (Linux or WSL, needs `redis-server` and `redis-benchmark`):

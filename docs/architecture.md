@@ -442,12 +442,12 @@ two processes stop sharing. Median of 3 runs:
 
 | Server | Writes during save | Memory | `BGSAVE` reply | Save | Copy-on-write peak |
 | --- | --- | ---: | ---: | ---: | ---: |
-| Mini Redis | None | 304 MB | 3.6 ms | 0.94 s | 247 MB (81%) |
-| Mini Redis | `SET`, 50 clients | 319 MB | 5.3 ms | 1.05 s | 272 MB (85%) |
-| Mini Redis with `gc.freeze()` | None | 304 MB | 4.7 ms | 0.94 s | 247 MB (81%) |
-| Mini Redis with `gc.freeze()` | `SET`, 50 clients | 319 MB | 5.6 ms | 1.04 s | 272 MB (85%) |
-| Real Redis | None | 170 MB | 2.9 ms | 0.54 s | 1 MB (1%) |
-| Real Redis | `SET`, 50 clients | 199 MB | 24.0 ms | 0.62 s | 32 MB (16%) |
+| Mini Redis | None | 304 MB | 5.6 ms | 1.07 s | 247 MB (81%) |
+| Mini Redis | `SET`, 50 clients | 319 MB | 5.6 ms | 1.12 s | 272 MB (85%) |
+| Mini Redis with `gc.freeze()` | None | 304 MB | 4.2 ms | 0.96 s | 247 MB (81%) |
+| Mini Redis with `gc.freeze()` | `SET`, 50 clients | 319 MB | 5.9 ms | 1.05 s | 272 MB (85%) |
+| Real Redis | None | 170 MB | 7.1 ms | 0.55 s | 1 MB (1%) |
+| Real Redis | `SET`, 50 clients | 199 MB | 29.8 ms | 0.65 s | 32 MB (16%) |
 
 The reply time includes the fork. Under load it also includes waiting behind
 the other clients' commands.
@@ -462,8 +462,15 @@ to are copied.
 
 `gc.freeze()` keeps the garbage collector from touching objects, but the copies
 come from reference counts, so it changed nothing: 247 MB with it and without
-it. The server does not use it. The full report is
-[bench/results/bgsave-fork-and-cow-2026-11-09-e8edb44-dirty.md](../bench/results/bgsave-fork-and-cow-2026-11-09-e8edb44-dirty.md).
+it. The server does not use it.
+
+One timing is not explained. Under writes, the slowest `PING` during a save
+was 16 to 23 ms in 3 of 6 runs without `gc.freeze()` (across this report and
+an earlier run), and about 5 ms in all 6 runs with it. A full garbage
+collection over 1M keys takes about 0.5 ms here, because the value tuples hold
+only strings and bytes and Python stops tracking them, so the collector is not
+the cause. With this few runs it may be noise. The full report is
+[bench/results/bgsave-fork-and-cow-2026-11-09-2dde6e9.md](../bench/results/bgsave-fork-and-cow-2026-11-09-2dde6e9.md).
 
 ## 10. Replication
 
