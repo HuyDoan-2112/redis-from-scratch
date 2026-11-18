@@ -270,6 +270,11 @@ class CommandParser:
         self.args: list[Value] = []
         self.args_left = 0  # arguments still to read. 0 = between commands
         self.bulk_len = -1  # length of the next argument. -1 = "$<len>" line not read yet
+        
+        # Byte counts for the replication offset. A replica's offset must count
+        # only commands it has fully received, never half of one.
+        self.dropped = 0      # bytes deleted from the front of buf so far
+        self.bytes_used = 0   # bytes of every complete command returned so far
 
     def feed(self, data: bytes) -> None:
         """Add bytes received from the stream."""
@@ -288,6 +293,7 @@ class CommandParser:
             # Drop the bytes parsed in this call. What they said is kept in
             # args, args_left and bulk_len. Deleting from the front of a
             # bytearray is cheap in CPython: it moves the start pointer.
+            self.dropped += self.pos
             del self.buf[:self.pos]
             self.pos = 0
 
@@ -366,4 +372,5 @@ class CommandParser:
         """Return the command just completed and get ready for the next one."""
         command = Value(typ=RESPType.ARRAY, array=self.args)
         self.args = []
+        self.bytes_used = self.dropped + self.pos
         return command
