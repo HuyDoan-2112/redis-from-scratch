@@ -145,5 +145,80 @@ class TestBadInput(unittest.TestCase):
         self.assertEqual(parse_in_chunks(almost, len(almost)), [])
 
 
+class TestBytesUsed(unittest.TestCase):
+    """bytes_used is the replica's offset: the bytes of every complete command
+    so far, never part of a command that has not fully arrived."""
+
+    SET = bulk_cmd(b"SET", b"a", b"1")  # 27 bytes
+    DEL = bulk_cmd(b"DEL", b"b")        # 20 bytes
+
+    def test_new_parser(self):
+        self.assertEqual(CommandParser().bytes_used, 0)
+
+    def test_one_command(self):
+        parser = CommandParser()
+        parser.feed(self.SET)
+        parser.next_command()
+        self.assertEqual(parser.bytes_used, 27)
+
+    def test_half_command_is_not_counted(self):
+        """If the link drops here, the replica must ask for byte 28, the start
+        of DEL, not byte 38 in the middle of it."""
+        parser = CommandParser()
+        parser.feed(self.SET + self.DEL[:10])
+        parser.next_command()
+        self.assertIsNone(parser.next_command())
+        self.assertEqual(parser.bytes_used, 27)
+        parser.feed(self.DEL[10:])
+        parser.next_command()
+        self.assertEqual(parser.bytes_used, 47)
+
+    def test_every_split(self):
+        """After each recv-sized chunk, bytes_used is the end of the last
+        complete command, however the stream is cut."""
+        ends, total = [], 0
+        for command in PIPELINE:
+            total += len(bulk_cmd(*command))
+            ends.append(total)
+        for size in (1, 2, 3, 7, 1024, len(PIPELINE_BYTES)):
+            with self.subTest(chunk_size=size):
+                parser = CommandParser()
+                for i in range(0, len(PIPELINE_BYTES), size):
+                    parser.feed(PIPELINE_BYTES[i:i + size])
+                    while parser.next_command() is not None:
+                        pass
+                    received = min(i + size, len(PIPELINE_BYTES))
+                    complete = [end for end in ends if end <= received]
+                    self.assertEqual(parser.bytes_used, complete[-1] if complete else 0)
+
+    def test_counts_the_bytes_received_not_a_re_encoding(self):
+        """$03 is accepted for a 3-byte argument. The offset must count the 4
+        bytes that arrived, not the 3 that marshal() would write."""
+        data = b"*1\r\n$03\r\nDEL\r\n"
+        parser = CommandParser()
+        parser.feed(data)
+        command = parser.next_command()
+        self.assertEqual(parser.bytes_used, len(data))
+        self.assertEqual(len(command.marshal()), len(data) - 1)
+
+    def test_stream_recorded_from_redis(self):
+        """A replication stream from Redis 8.10.3: a ping, then SELECT 0,
+        SET b 2 EX 100 and EXPIRE a 100 as Redis propagates them, then two
+        pings. INFO replication reported master_repl_offset:168 at the end."""
+        stream = (
+            b"*1\r\n$4\r\nping\r\n"
+            b"*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n"
+            b"*5\r\n$3\r\nset\r\n$1\r\nb\r\n$1\r\n2\r\n$4\r\nPXAT\r\n$13\r\n1794960536880\r\n"
+            b"*3\r\n$9\r\nPEXPIREAT\r\n$1\r\na\r\n$13\r\n1794960536882\r\n"
+            b"*1\r\n$4\r\nping\r\n"
+            b"*1\r\n$4\r\nping\r\n"
+        )
+        parser = CommandParser()
+        parser.feed(stream)
+        while parser.next_command() is not None:
+            pass
+        self.assertEqual(parser.bytes_used, 168)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
