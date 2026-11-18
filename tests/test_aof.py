@@ -79,7 +79,7 @@ class TestAOFRecovery(unittest.TestCase):
         aof = AOF(AOFConfig(path=self.path, enabled=True))
         with contextlib.redirect_stdout(io.StringIO()):
             aof.read(lambda v: None)
-        aof.write(make_cmd("SET", "c", "3"))
+        aof.write(make_cmd("SET", "c", "3").marshal())
         aof.close()
 
         # Restart #2: must not crash, and must see a and c
@@ -99,7 +99,7 @@ class TestAOFRecovery(unittest.TestCase):
         aof = AOF(AOFConfig(path=self.path, enabled=True))
         with contextlib.redirect_stdout(io.StringIO()):
             aof.read(lambda v: None)
-        aof.write(make_cmd("SET", "c", "3"))
+        aof.write(make_cmd("SET", "c", "3").marshal())
         aof.close()
 
         try:
@@ -144,8 +144,8 @@ class AOFTest(unittest.TestCase):
 class TestBuffer(AOFTest):
     def test_write_reaches_the_file_only_on_flush(self):
         aof = self.open_aof()
-        aof.write(make_cmd("SET", "a", "1"))
-        aof.write(make_cmd("SET", "b", "2"))
+        aof.write(make_cmd("SET", "a", "1").marshal())
+        aof.write(make_cmd("SET", "b", "2").marshal())
         self.assertEqual(self.path.read_bytes(), b"")
 
         aof.flush()
@@ -159,7 +159,7 @@ class TestBuffer(AOFTest):
                 with mock.patch.object(os, "fsync", wraps=os.fsync) as fsync:
                     aof = self.open_aof(policy)
                     fd = aof.fd
-                    aof.write(make_cmd("SET", "a", "1"))
+                    aof.write(make_cmd("SET", "a", "1").marshal())
 
                     self.close(aof)
 
@@ -172,7 +172,7 @@ class TestFsyncPolicy(AOFTest):
         fsync = self.record_fsyncs()
         aof = self.open_aof("always")
 
-        aof.write(make_cmd("SET", "a", "1"))
+        aof.write(make_cmd("SET", "a", "1").marshal())
         aof.flush()
         self.assertEqual(fsync.call_count, 1)
         fsync.assert_called_with(aof.fd)
@@ -180,7 +180,7 @@ class TestFsyncPolicy(AOFTest):
         aof.flush()  # nothing buffered: no write, no fsync
         self.assertEqual(fsync.call_count, 1)
 
-        aof.write(make_cmd("SET", "b", "2"))
+        aof.write(make_cmd("SET", "b", "2").marshal())
         aof.flush()
         self.assertEqual(fsync.call_count, 2)
 
@@ -188,7 +188,7 @@ class TestFsyncPolicy(AOFTest):
         fsync = self.record_fsyncs()
         aof = self.open_aof("everysec")
 
-        aof.write(make_cmd("SET", "a", "1"))
+        aof.write(make_cmd("SET", "a", "1").marshal())
         aof.flush()
         self.assertEqual(fsync.call_count, 0, "flush() itself must not fsync")
 
@@ -201,7 +201,7 @@ class TestFsyncPolicy(AOFTest):
         fsync = self.record_fsyncs()
         aof = self.open_aof("no")
 
-        aof.write(make_cmd("SET", "a", "1"))
+        aof.write(make_cmd("SET", "a", "1").marshal())
         aof.flush()
         time.sleep(1.2)  # longer than the everysec interval
 

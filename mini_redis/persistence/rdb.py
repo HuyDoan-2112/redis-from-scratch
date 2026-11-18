@@ -4,7 +4,7 @@ import struct
 import time
 import zlib
 
-from typing import BinaryIO
+from typing import BinaryIO, Callable
 
 from mini_redis.config import RDBConfig
 from mini_redis.persistence import child
@@ -16,7 +16,7 @@ VERSION = 1
 TYPE_STRING = 0
 TYPE_HASH = 1
 EOF = 0xFF
-NO_EXPIRE = -1 
+NO_EXPIRE = -1
 
 _U32 = struct.Struct("<I")
 _I64 = struct.Struct("<q")
@@ -35,7 +35,7 @@ class _Writer:
     def __init__(self, out: BinaryIO):
         self._out = out
         self._buf = bytearray()
-        self.crc = 0 
+        self.crc = 0
 
     def write(self, data: bytes) -> None:
         self._buf += data
@@ -52,9 +52,9 @@ class _Writer:
         self._out.write(self._buf)
         self._buf.clear()
 
-def dump(out: BinaryIO, 
-         store: dict[bytes, tuple[str, object]], 
-         expires: dict[bytes, int], 
+def dump(out: BinaryIO,
+         store: dict[bytes, tuple[str, object]],
+         expires: dict[bytes, int],
          now_ms: int
 ) -> None:
     """Write a snapshot of store and expires to out."""
@@ -91,7 +91,7 @@ def dump(out: BinaryIO,
     w.write(bytes([EOF]))
     w.flush()
     out.write(_U32.pack(w.crc))
-    
+
 class _Reader:
 
     def __init__(self, inp: BinaryIO):
@@ -134,13 +134,13 @@ class _Reader:
 
     def at_end(self) -> bool:
         return self._pos == len(self._buf) and not self._inp.read(1)
-    
+
 
 def load(inp: BinaryIO, now_ms: int) -> tuple[dict[bytes, tuple[str, object]], dict[bytes, int]]:
     """
-    Read a snapshot. 
-    
-    Returns new (store, expires) dicts. 
+    Read a snapshot.
+
+    Returns new (store, expires) dicts.
     Raises RDBError for a bad file
     """
     r = _Reader(inp)
@@ -158,7 +158,7 @@ def load(inp: BinaryIO, now_ms: int) -> tuple[dict[bytes, tuple[str, object]], d
             break
         if typ not in (TYPE_STRING, TYPE_HASH):
             raise RDBError(f"unknown record type {typ}")
-        
+
         expire = _I64.unpack(r.read(8))[0]
         key = r.blob()
         if typ == TYPE_STRING:
@@ -198,7 +198,8 @@ class RDB:
         self.dirty = 0
         self._dirty_at_fork = 0
         self._last_try = 0.0
-    
+        self._on_done: Callable[[bool], None] | None = None  # told when the running save ends
+
     def load_file(self) -> int | None:
         """Load the snapshot file into the keyspace. Returns the number of keys,
            or None if there is no file. Raises RDBError or OSError for a file that can't be used."""
@@ -212,10 +213,11 @@ class RDB:
             raise RDBError(err.strerror) from err
         keyspace.replace_all(new_store, new_expires)
         print(f"DB loaded from disk: {len(new_store)} keys in {time.perf_counter() - started:.3f} seconds")
-        return len(new_store)   
-    
-    def start_save(self) -> None:
-        """Start a save in a child process. The caller makes sure no child is running."""
+        return len(new_store)
+
+    def start_save(self, on_done: Callable[[bool], None] | None = None) -> None:
+        """Start a save in a child process. The caller makes sure no child is running.
+        on_done(ok) runs after the save ends, as replication needs to know."""
         self._dirty_at_fork = self.dirty   # what this save will cover
         self._last_try = time.time()       # for the 5-second retry delay
         try:
@@ -223,16 +225,17 @@ class RDB:
         except OSError:
             self.last_save_ok = False      # fork failed: the retry delay applies too
             raise
+        self._on_done = on_done
 
     def _write_file(self) -> None:
         temp = self._temp_path()
         with open(temp, "wb") as f:
-            dump(f, keyspace.store, keyspace.expires, keyspace.now_ms()) 
+            dump(f, keyspace.store, keyspace.expires, keyspace.now_ms())
             f.flush() # Py buffer -> kernel
             os.fsync(f.fileno())   # kernel -> disk
         os.replace(temp, self.config.path)
         fsync_dir(self.config.path.parent)
-        
+
     def save(self) -> None:
         """Save in this process, at shutdown. Raises OSError if it fails."""
         try:
@@ -257,7 +260,7 @@ class RDB:
             if self.dirty >= changes and now - self.lastsave > seconds:
                 return (seconds, changes)
         return None
-    
+
     def _save_done(self, ok: bool) -> None:
         self.last_save_ok = ok
         if ok:
@@ -265,13 +268,16 @@ class RDB:
             self.lastsave = int(time.time())
             self.dirty -= self._dirty_at_fork
             print("Background saving terminated with success")
-            return
-        # Failed or killed. child.check() already printed why, so don't print it again.
-        try:
-            self._temp_path().unlink(missing_ok=True)
-        except OSError as err:
-            print(f"Could not remove {self._temp_path()}: {err}")    
-    
+        else:
+            # Failed or killed. child.check() already printed why, so don't print it again.
+            try:
+                self._temp_path().unlink(missing_ok=True)
+            except OSError as err:
+                print(f"Could not remove {self._temp_path()}: {err}")
+        on_done, self._on_done = self._on_done, None
+        if on_done is not None:
+            on_done(ok)
+
     def _temp_path(self) -> Path:
         """Temp file next to dump.rdb, so os.replace is atomic."""
         return self.config.path.with_name("temp-bgsave.rdb")

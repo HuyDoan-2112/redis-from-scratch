@@ -6,7 +6,14 @@ import sys
 import argparse
 from pathlib import Path
 
-from mini_redis.config import DEFAULT_CONFIG, FSYNC_POLICIES, AOFConfig, RDBConfig, ServerConfig
+from mini_redis.config import (
+    DEFAULT_CONFIG,
+    FSYNC_POLICIES,
+    AOFConfig,
+    RDBConfig,
+    ReplicationConfig,
+    ServerConfig,
+)
 
 def parse_save_points(text: str) -> tuple[tuple[int, int], ...]:
     """'60 1000 300 10' -> ((60, 1000), (300, 10))"""
@@ -60,17 +67,24 @@ def parse_args(argv: list[str] | None = None) -> ServerConfig:
         help=f"when to fsync the AOF (default: {DEFAULT_CONFIG.aof.appendfsync})",
     )
     parser.add_argument(
-            "--rdb-path",
-            type=Path,
-            default=DEFAULT_CONFIG.rdb.path,
-            help=f"rdb file location (default: {DEFAULT_CONFIG.rdb.path})",
-        )
+        "--rdb-path",
+        type=Path,
+        default=DEFAULT_CONFIG.rdb.path,
+        help=f"rdb file location (default: {DEFAULT_CONFIG.rdb.path})",
+    )
     parser.add_argument(
         "--save",
         type=parse_save_points,
         default=DEFAULT_CONFIG.rdb.save_points,
         metavar='"SECONDS CHANGES ..."',
         help="save automatically after SECONDS if at least CHANGES writes happened (default: off)",
+    )
+    parser.add_argument(
+        "--repl-ping-replica-period",
+        type=int,
+        default=DEFAULT_CONFIG.replication.ping_period,
+        metavar="SECONDS",
+        help=f"seconds between PINGs to replicas (default: {DEFAULT_CONFIG.replication.ping_period})",
     )
     args = parser.parse_args(argv)
 
@@ -82,6 +96,7 @@ def parse_args(argv: list[str] | None = None) -> ServerConfig:
             port=args.port,
             aof=AOFConfig(enabled=args.aof, path=args.aof_path, appendfsync=args.appendfsync),
             rdb=RDBConfig(path=args.rdb_path, save_points=args.save),
+            replication=ReplicationConfig(ping_period=args.repl_ping_replica_period),
         )
     except ValueError as err:
         parser.error(str(err))

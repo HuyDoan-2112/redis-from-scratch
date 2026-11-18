@@ -20,7 +20,7 @@ class Backlog:
         self.offset = offset        # byte number of the last byte fed
         self.histlen = 0            # bytes held, at most size
         self.idx = 0                # where the next byte goes in buf
-        
+
     @property
     def first_byte_offset(self) -> int:
         """Byte number of the oldest byte held."""
