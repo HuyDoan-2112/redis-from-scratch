@@ -82,5 +82,14 @@ class TestParseArgs(unittest.TestCase):
         with self.assertRaises(ValueError):
             RDBConfig(save_points=((60, 0),))
 
+    def test_repl_ping_replica_period_default(self):
+        self.assertEqual(parse_args([]).replication.ping_period, 10)
+
+    def test_repl_ping_replica_period(self):
+        self.assertEqual(parse_args(["--repl-ping-replica-period", "1"]).replication.ping_period, 1)
+
+    def test_repl_ping_replica_period_must_be_at_least_one(self):
+        self.assert_usage_error(["--repl-ping-replica-period", "0"], "ping_period must be at least 1 second")
+
 if __name__ == "__main__":
     unittest.main()

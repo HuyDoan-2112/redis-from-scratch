@@ -6,6 +6,19 @@ from pathlib import Path
 FSYNC_POLICIES = ("always", "everysec", "no")
 
 @dataclass(frozen=True)
+class ReplicationConfig:
+    """Configuration for master-replica replication."""
+
+    backlog_size: int = 1024 * 1024     # repl-backlog-size, same 1 MB default as Redis
+    ping_period: int = 10               # seconds between PINGs to replicas
+
+    def __post_init__(self) -> None:
+        if self.backlog_size < 16*1024:
+            raise ValueError("backlog_size must be at least 16 KB")   # Redis's minimum
+        if self.ping_period < 1:
+            raise ValueError("ping_period must be at least 1 second")
+
+@dataclass(frozen=True)
 class RDBConfig:
     """Configuration for RDB snapshots."""
 
@@ -24,7 +37,7 @@ class AOFConfig:
     enabled: bool = False  # Whether AOF is enabled
     sync_interval_secs: int = 1  # Interval in seconds to sync AOF to disk
     appendfsync: str = "everysec" # When to fsync: see FSYNC_POLICIES
-    
+
     def __post_init__(self) -> None:
         if not self.path:
             raise ValueError("AOF file path must be specified")
@@ -44,6 +57,7 @@ class ServerConfig:
     hz: int = 10  # How often to run the server's periodic tasks, in times per second
     aof: AOFConfig = field(default_factory=AOFConfig)
     rdb: RDBConfig = field(default_factory=RDBConfig)
+    replication: ReplicationConfig = field(default_factory=ReplicationConfig)
 
     def __post_init__(self) -> None:
         if not 0 < self.port <= 65535:

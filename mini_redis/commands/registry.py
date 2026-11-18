@@ -1,7 +1,9 @@
 from typing import Callable, List
 from dataclasses import dataclass
 
+from mini_redis.commands.info import info_cmd
 from mini_redis.commands.persistence import bgrewriteaof_cmd, bgsave_cmd, lastsave_cmd
+from mini_redis.commands.replication import psync_cmd, replconf_cmd
 from mini_redis.resp import RESPType, Value
 from mini_redis.commands.connection import ping, echo
 from mini_redis.commands.strings import set_cmd, get, incr_cmd
@@ -21,12 +23,14 @@ class Command:
     """One entry in the command table, the same idea as Redis's redisCommand."""
 
     name: str
-    # Gets the arguments without the command name, returns the reply.
-    handler: Callable[[List[Value]], Value]
+    # Gets the arguments without the command name and returns the reply, or
+    # None for no reply. With needs_client=True it gets (client, args).
+    handler: Callable[..., Value | None]
     # Number of items including the command name: GET key is 2.
     # Negative means "at least": -1 is 1 or more (PING, PING msg).
     arity: int
     write: bool = False # True if the command modifies the store, False if it only reads
+    needs_client: bool = False # True for commands that change their own connection
 
     def arity_ok(self, n: int) -> bool:
         """Check the request length `n` (command name included)."""
@@ -65,5 +69,8 @@ cmds = [
     Command("BGREWRITEAOF", bgrewriteaof_cmd, 1),
     Command("BGSAVE", bgsave_cmd, 1),
     Command("LASTSAVE", lastsave_cmd, 1),
+    Command("INFO", info_cmd, -1),
+    Command("REPLCONF", replconf_cmd, -1, needs_client=True),
+    Command("PSYNC", psync_cmd, -3, needs_client=True),
 ]
 COMMANDS: dict[str, Command] = {c.name: c for c in cmds}

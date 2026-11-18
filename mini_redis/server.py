@@ -16,7 +16,9 @@ from mini_redis.propagation import take
 from mini_redis.storage.expire import active_expire_cycle
 from mini_redis.storage.keyspace import now_ms
 from mini_redis.persistence import aof as aof_module, child, rdb as rdb_module
- 
+from mini_redis.replication import master as master_module
+from mini_redis.replication.master import Master, ReplicaState
+
 # Signals that stop the server cleanly.
 SHUTDOWN_SIGNALS = [signal.SIGINT, signal.SIGTERM]
 
@@ -39,9 +41,10 @@ def run(config: ServerConfig = DEFAULT_CONFIG) -> None:
         except Exception:
             aof.close()
             raise
-        
+
     aof_module.current = aof
     rdb_module.current = rdb
+    master_module.current = Master(config.replication)
 
     sel = selectors.DefaultSelector()
     lsock = socket.socket(socket.AF_INET, socket.SOCK_STREAM) # AF_INET = IPv4, SOCK_STREAM = TCP
@@ -80,7 +83,7 @@ def run(config: ServerConfig = DEFAULT_CONFIG) -> None:
                 if prepare_for_shutdown(rdb):
                     break
                 received.clear()       # keep serving; the next signal tries again
-                
+
             timeout = max(0.0, next_cron - time.monotonic())
             # Block until at least one socket is ready. `mask` says whether it
             # is ready to read, to write, or both.
@@ -118,6 +121,18 @@ def before_sleep(sel: selectors.BaseSelector, aof: AOF | None, pending_writes: s
             flush_output(sel, client)
     pending_writes.clear()
 
+    master = master_module.current
+    if master is not None:
+        # Replicas dropped this turn (a failed sync), unless they already left.
+        for client in master.close_asap:
+            if client.sock.fileno() != -1:
+                close_client(sel, client)
+        master.close_asap.clear()
+        # Stream bytes and sync replies from feed() and cron are not in pending_writes.
+        for client in master.replicas:
+            if client.outbuf:
+                flush_output(sel, client)
+
 def drain(sock: socket.socket) -> None:
     """Read and drop all waiting bytes."""
     try:
@@ -131,6 +146,10 @@ def shutdown(sel: selectors.BaseSelector, aof: AOF | None) -> None:
     child.kill()
     if aof is not None:
         aof.close()  # flush and fsync
+    master = master_module.current
+    if master is not None:
+        for client in list(master.replicas):
+            master.remove(client)  # close the RDB files being sent
     for key in list(sel.get_map().values()):
         sel.unregister(key.fileobj)
         key.fileobj.close()
@@ -205,9 +224,15 @@ def process_input(client: Client, data: bytes, aof: AOF | None) -> None:
             break
         if request is None:
             break  # the buffer ends mid-command: wait for the rest
-        client.outbuf += execute(request, aof).marshal()
+        reply = execute(request, aof, client)
+        # A replica's connection carries only the replication stream, so it
+        # never gets replies.
+        if reply is not None and client.replica is None:
+            client.outbuf += reply.marshal()
 
 def close_client(sel: selectors.BaseSelector, client: Client) -> None:
+    if master_module.current is not None:
+        master_module.current.remove(client)  # if it was a replica
     # Unregister first: the selector cannot look up a socket that is closed.
     sel.unregister(client.sock)
     client.sock.close()
@@ -228,8 +253,10 @@ def replay_command(request: Value) -> None:
     if response.typ == RESPType.ERROR:
         raise ValueError(f"Failed to replay {cmd.name}: {response.string}")
 
-def execute(request: Value, aof: AOF | None) -> Value:
-    """Run one command and return its reply.
+def execute(request: Value, aof: AOF | None, client: Client | None = None) -> Value | None:
+    """Run one command and return its reply, or None when there is none
+    (REPLCONF ACK, or PSYNC, which writes its own reply). `client` is the
+    connection that sent it, for commands with needs_client=True.
 
     Raises only when a write command crashes, which stops the server.
     """
@@ -241,7 +268,7 @@ def execute(request: Value, aof: AOF | None) -> Value:
     args = request.array[1:]  # drop the command name
 
     try:
-        response = cmd.handler(args)
+        response = cmd.handler(client, args) if cmd.needs_client else cmd.handler(args)
     except CommandError as e:
         # A bad argument from the client, not a bug: reply with the error
         response = Value(typ=RESPType.ERROR, string=str(e))
@@ -272,8 +299,20 @@ def flush_output(sel: selectors.BaseSelector, client: Client) -> None:
             close_client(sel, client)
             return
 
+    # A replica receiving dump.rdb: once the reply and the $<size> header are
+    # out, send the next piece of the file.
+    replica = client.replica
+    sending_file = replica is not None and replica.state is ReplicaState.SEND_BULK
+    if sending_file and not client.outbuf:
+        try:
+            master_module.current.send_bulk(client)
+        except OSError:
+            close_client(sel, client)  # the replica went away mid-transfer
+            return
+        sending_file = replica.state is ReplicaState.SEND_BULK
+
     # Decide what to wait for next
-    if client.outbuf:
+    if client.outbuf or sending_file:
         if client.closing:
             set_events(sel, client, selectors.EVENT_WRITE)  # only wait to send
         else:
@@ -294,13 +333,23 @@ def write_changes(aof: AOF | None) -> None:
     if rdb_module.current is not None:
         rdb_module.current.dirty += len(changes)
 
-    if aof is not None:
-        for change in changes:
-            aof.write(change)
+    master = master_module.current
+    if aof is None and (master is None or master.backlog is None):
+        return  # nobody needs the bytes: skip encoding (the common case without AOF)
+
+    for change in changes:
+        data = change.marshal()  # encode once for the AOF and the replicas
+        if aof is not None:
+            aof.write(data)
+        if master is not None:
+            master.feed(data)
 
 def cron(aof: AOF | None, hz: int) -> None:
     """Run periodic tasks, once per tick."""
     child.check()
+    # Replicas waiting for a sync go first, before a scheduled rewrite or a save point.
+    if master_module.current is not None:
+        master_module.current.cron(time.monotonic())
     if aof is not None and aof.rewrite_scheduled and child.kind is None:
         try:
             aof.start_rewrite()

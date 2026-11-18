@@ -82,9 +82,9 @@ class AOF:
 
         self.rewrite_buf: bytearray | None = None
         self.close_threads: list[threading.Thread] = []  # Closing old AOF fds after a rewrite.
-           
+
         self.rewrite_scheduled = False   # BGREWRITEAOF came in while another child was running
-    
+
     def _sync_loop(self) -> None:
         """Background thread for everysec: fsync the file once per interval."""
         # wait() returns False on timeout (time to sync) and True once
@@ -163,9 +163,8 @@ class AOF:
         fd = self._write_snapshot(temp)
         self._install(fd, temp)
 
-    def write(self, value: Value) -> None:
-        """Add one write command to the buffer. flush() writes it to the file."""
-        data = value.marshal()
+    def write(self, data: bytes) -> None:
+        """Add one encoded write command to the buffer. flush() writes it to the file."""
         self.buf += data
         if self.rewrite_buf is not None:
             self.rewrite_buf += data
